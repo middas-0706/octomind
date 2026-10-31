@@ -274,6 +274,42 @@ async fn spawn_returns_none_for_provider_without_keepalive_policy() {
 }
 
 #[tokio::test]
+async fn a_reply_wait_with_work_in_flight_is_a_background_wait() {
+	use crate::session::tap_runs::{self, TapJob, TapJobStatus, TapLiveState};
+	use std::sync::{Arc, RwLock};
+
+	let id = "keepalive-background".to_string();
+	crate::session::context::with_session_id(id.clone(), async {
+		tap_runs::init_for_session();
+		let (cancel_tx, _keep_alive) = watch::channel(false);
+		tap_runs::register_job(TapJob {
+			id: "keepalive-background-run".to_string(),
+			role: "developer:general".to_string(),
+			workdir: "/tmp".to_string(),
+			started_at: std::time::SystemTime::UNIX_EPOCH,
+			error: None,
+			status: Arc::new(RwLock::new(TapJobStatus::Running)),
+			cancel_tx,
+			live: Arc::new(RwLock::new(TapLiveState::default())),
+		});
+
+		let config = keepalive_config();
+		let mut chat = session("anthropic:claude-sonnet-5-5", vec![user_message(true)]);
+		let handle = KeepaliveHandle::spawn(&chat, &config, WaitKind::Reply).expect("cached Anthropic session spawns");
+		handle.finish(&mut chat, true).await;
+
+		assert_eq!(
+			chat.wait_history.samples(WaitKind::Background).len(),
+			1,
+			"a running tap is a result that will come back"
+		);
+		assert!(chat.wait_history.samples(WaitKind::Reply).is_empty());
+	})
+	.await;
+	crate::session::context::cleanup_session(&id);
+}
+
+#[tokio::test]
 async fn finish_records_how_the_wait_ended() {
 	let config = keepalive_config();
 	let mut chat = session("anthropic:claude-sonnet-5-5", vec![user_message(true)]);
