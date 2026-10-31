@@ -266,12 +266,11 @@ impl OctomindAgent {
 		}
 	}
 
-	/// Connection ended: stop every idle-session keepalive and fold its ping costs
-	/// into the session before telemetry reads them. The wait never got its answer,
+	/// Connection ended: stop every idle-session keepalive and bill its pings to
+	/// the session before telemetry reads them. The wait never got its answer,
 	/// so it is not recorded.
 	async fn finish_keepalives(&self) {
 		let handles: Vec<_> = self.keepalives.borrow_mut().drain().collect();
-		let config = self.config.borrow().get_merged_config_for_role(&self.role);
 		for (session_id, handle) in handles {
 			// A handle exists only while its session sits idle in the map.
 			let entry = self.sessions.borrow_mut().remove(&session_id);
@@ -279,7 +278,7 @@ impl OctomindAgent {
 				log_debug!("ACP: keepalive for {} outlived its session", session_id);
 				continue;
 			};
-			handle.finish(&mut chat_session, &config, false).await;
+			handle.finish(&mut chat_session, false).await;
 			if let Err(e) = chat_session.save() {
 				log_debug!("ACP: failed to save session after keepalive: {}", e);
 			}
@@ -796,7 +795,7 @@ impl OctomindAgent {
 						let config_for_role = config.borrow().get_merged_config_for_role(&role);
 						let keepalive = keepalives.borrow_mut().remove(&session_id);
 						if let Some(handle) = keepalive {
-							handle.finish(&mut chat_session, &config_for_role, true).await;
+							handle.finish(&mut chat_session, true).await;
 						}
 
 						let op_rx = cancellations
@@ -1367,7 +1366,7 @@ impl OctomindAgent {
 			// the next AI turn starts.
 			let keepalive = self.keepalives.borrow_mut().remove(&session_id);
 			if let Some(handle) = keepalive {
-				handle.finish(&mut chat_session, &config_for_role, true).await;
+				handle.finish(&mut chat_session, true).await;
 			}
 
 			// Get or create cancellation for this session

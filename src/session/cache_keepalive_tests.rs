@@ -223,16 +223,62 @@ async fn finish_records_a_completed_wait_and_skips_an_abandoned_one() {
 
 	let handle = KeepaliveHandle::spawn(&chat, &config, WaitKind::Tools).expect("cached Anthropic session spawns");
 	// The first ping is one interval away, so finishing now sends nothing.
-	assert_eq!(handle.finish(&mut chat, &config, true).await, 0);
+	assert_eq!(handle.finish(&mut chat, true).await, 0);
 	assert_eq!(chat.wait_history.samples(WaitKind::Tools).len(), 1);
 
 	let handle = KeepaliveHandle::spawn(&chat, &config, WaitKind::Tools).expect("spawns again");
-	handle.finish(&mut chat, &config, false).await;
+	handle.finish(&mut chat, false).await;
 	assert_eq!(
 		chat.wait_history.samples(WaitKind::Tools).len(),
 		1,
 		"an abandoned wait must not feed the budget"
 	);
+}
+
+fn ping_exchange(cost: Option<f64>) -> ProviderExchange {
+	ProviderExchange {
+		request: serde_json::Value::Null,
+		response: serde_json::Value::Null,
+		timestamp: 0,
+		usage: Some(crate::providers::TokenUsage {
+			input_tokens: 4,
+			cache_read_tokens: 20_000,
+			cache_write_tokens: 0,
+			output_tokens: 0,
+			reasoning_tokens: 0,
+			total_tokens: 20_004,
+			cost,
+			request_time_ms: Some(300),
+		}),
+		provider: "anthropic".to_string(),
+		rate_limit_headers: None,
+	}
+}
+
+#[test]
+fn pings_bill_cost_without_touching_turn_counters() {
+	let mut info = session("anthropic:claude-sonnet-5-5", Vec::new()).session.info;
+	let before = info.clone();
+
+	bill_pings(&mut info, &[ping_exchange(Some(0.002)), ping_exchange(Some(0.002))]);
+
+	assert!(
+		(info.total_cost - before.total_cost - 0.004).abs() < 1e-12,
+		"pings are part of the bill"
+	);
+	// Compression paces itself and sizes context from these: a ping is not a
+	// conversation request.
+	assert_eq!(info.total_api_calls, before.total_api_calls);
+	assert_eq!(info.current_total_tokens, before.current_total_tokens);
+	assert_eq!(info.cache_read_tokens, before.cache_read_tokens);
+	assert_eq!(info.total_api_time_ms, before.total_api_time_ms);
+}
+
+#[test]
+fn a_ping_without_reported_cost_marks_the_main_cost_unknown() {
+	let mut info = session("anthropic:claude-sonnet-5-5", Vec::new()).session.info;
+	bill_pings(&mut info, &[ping_exchange(None)]);
+	assert_eq!(info.main_cost, None, "an unpriced ping must not pass for free");
 }
 
 // --- run -------------------------------------------------------------------

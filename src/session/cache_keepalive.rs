@@ -38,7 +38,7 @@
 
 use crate::config::{Config, ModelProfile};
 use crate::providers::{ChatCompletionParams, ProviderExchange, ProviderFactory};
-use crate::session::chat::{ChatSession, CostTracker};
+use crate::session::chat::ChatSession;
 use crate::session::Message;
 use anyhow::Result;
 use std::time::{Duration, Instant};
@@ -170,7 +170,7 @@ impl KeepaliveHandle {
 	/// records the elapsed time as a completed wait — pass `false` when the
 	/// wait ended without its answer (disconnect, unload, session exit), so
 	/// an abandoned wait never skews the next budget. Returns the ping count.
-	pub async fn finish(self, chat_session: &mut ChatSession, config: &Config, waited: bool) -> usize {
+	pub async fn finish(self, chat_session: &mut ChatSession, waited: bool) -> usize {
 		let elapsed = self.started.elapsed();
 		let _ = self.cancel_tx.send(true);
 		let exchanges = match self.task.await {
@@ -183,18 +183,26 @@ impl KeepaliveHandle {
 		if waited {
 			chat_session.wait_history.record(self.kind, elapsed);
 		}
-		for exchange in &exchanges {
-			if let Err(e) = CostTracker::track_exchange_cost(chat_session, exchange, config) {
-				crate::log_debug!("Failed to track keepalive cost: {}", e);
-			}
-		}
+		bill_pings(&mut chat_session.session.info, &exchanges);
+		chat_session.estimated_cost = chat_session.session.info.total_cost;
 		crate::log_debug!(
-			"Cache keepalive finished: kind={:?}, waited={}s, {} ping(s)",
+			"Cache keepalive finished: kind={:?}, waited={}s, {} ping(s), session_total=${:.5}",
 			self.kind,
 			elapsed.as_secs(),
-			exchanges.len()
+			exchanges.len(),
+			chat_session.session.info.total_cost
 		);
 		exchanges.len()
+	}
+}
+
+/// Pings are billed for their cost only. They are not conversation requests:
+/// counting them as API calls, prompt tokens or API time would skew the
+/// session's pace and context counters that compression decides on, and the
+/// cache statistics shown to the user.
+fn bill_pings(info: &mut crate::session::SessionInfo, exchanges: &[ProviderExchange]) {
+	for exchange in exchanges {
+		info.record_main_cost(exchange.usage.as_ref().and_then(|usage| usage.cost));
 	}
 }
 

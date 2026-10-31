@@ -88,21 +88,20 @@ async fn init_session_runtime(
 	})
 }
 
-/// Stop any in-flight cache-keepalive task and fold its ping costs into the
-/// session. `waited` is true when the wait ended with its answer (new input
-/// arrived) so it feeds future ping budgets; false on session exit. Returns
-/// `true` when at least one ping was folded — callers that persist post-fold
-/// (session save) check this to skip a no-op write.
+/// Stop any in-flight cache-keepalive task and bill its pings to the session.
+/// `waited` is true when the wait ended with its answer (new input arrived) so
+/// it feeds future ping budgets; false on session exit. Returns `true` when at
+/// least one ping was billed — callers that persist post-fold (session save)
+/// check this to skip a no-op write.
 async fn drain_keepalive_into_session(
 	keepalive: &mut Option<KeepaliveHandle>,
 	chat_session: &mut ChatSession,
-	config: &Config,
 	waited: bool,
 ) -> bool {
 	let Some(handle) = keepalive.take() else {
 		return false;
 	};
-	handle.finish(chat_session, config, waited).await > 0
+	handle.finish(chat_session, waited).await > 0
 }
 
 /// Apply clipboard blobs auto-attached via Ctrl+V to the active session.
@@ -689,7 +688,7 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 
 					// Input arrived: stop the keepalive that bridged the wait and fold its
 					// ping costs into the session before this turn adds anything.
-					drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await;
+					drain_keepalive_into_session(&mut keepalive, &mut chat_session, true).await;
 
 					// Handle the input result with proper error recovery
 					let mut input = match input_result {
@@ -1381,7 +1380,7 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 
 		// Session is ending — drain any in-flight keepalive so its cost is
 		// reflected in the persisted session log.
-		if drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await {
+		if drain_keepalive_into_session(&mut keepalive, &mut chat_session, false).await {
 			if let Err(e) = chat_session.save() {
 				crate::log_debug!("session save failed: {}", e);
 			}
@@ -1805,7 +1804,7 @@ pub async fn run_interactive_session_with_input(
 				// Stop any in-flight keepalive from the previous turn and fold
 				// its cost before we add the new user message — keeps the
 				// session log's cost ordering correct.
-				drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await;
+				drain_keepalive_into_session(&mut keepalive, &mut chat_session, true).await;
 
 				chat_session
 					.add_inbox_batch(batch, &current_config, operation_rx.clone())
@@ -1967,7 +1966,7 @@ pub async fn run_interactive_session_with_input(
 		}
 
 		// Drain any in-flight keepalive so its cost lands in the persisted log.
-		drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await;
+		drain_keepalive_into_session(&mut keepalive, &mut chat_session, false).await;
 
 		// A finished one-shot run learns exactly as an interactive exit does: the
 		// transcript goes to the detached `octomind distill` child, so the caller

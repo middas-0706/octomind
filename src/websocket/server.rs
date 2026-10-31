@@ -254,17 +254,15 @@ impl ServerState {
 		}
 	}
 
-	/// Ends the session's keepalive, if it has one, and folds its ping costs
-	/// into the session. `waited`: the wait ended with the turn it preceded,
-	/// not with a disconnect or an unload. Returns the ping count.
-	async fn finish_keepalive(&self, chat_session: &mut ChatSession, config: &Config, waited: bool) -> usize {
-		let session_id = chat_session.session.info.name.clone();
-		let handle = self.keepalives.lock().unwrap().remove(&session_id);
+	/// Ends the session's keepalive, if it has one, and bills its pings to the
+	/// session. `waited`: the wait ended with the turn it preceded, not with a
+	/// disconnect or an unload. Returns the ping count.
+	async fn finish_keepalive(&self, chat_session: &mut ChatSession, waited: bool) -> usize {
+		let handle = self.keepalives.lock().unwrap().remove(&chat_session.session.info.name);
 		let Some(handle) = handle else {
 			return 0;
 		};
-		// Ping costs are banked through the session's scope-keyed spend.
-		crate::session::context::with_session_id(session_id, handle.finish(chat_session, config, waited)).await
+		handle.finish(chat_session, waited).await
 	}
 }
 
@@ -1075,9 +1073,8 @@ async fn handle_close_message(
 	let unloaded = server.sessions.lock().await.remove(&session_id);
 	let was_loaded = unloaded.is_some();
 	if let Some(mut chat_session) = unloaded {
-		let config = session_config(&server.config, &server.role_configs, &chat_session).await;
 		// The session is dropped below: save the pings' cost, which no later turn will carry.
-		if server.finish_keepalive(&mut chat_session, &config, false).await > 0 {
+		if server.finish_keepalive(&mut chat_session, false).await > 0 {
 			if let Err(e) = chat_session.save() {
 				log_error!("Failed to save session {} after its keepalive: {}", session_id, e);
 			}
@@ -1132,9 +1129,8 @@ async fn release_ownerless_keepalive(server: ServerState, session_id: String) {
 		let Some(mut chat_session) = server.sessions.lock().await.remove(&session_id) else {
 			return;
 		};
-		let config = session_config(&server.config, &server.role_configs, &chat_session).await;
 		log_debug!("Client left session {}: stopping its cache keepalive", session_id);
-		server.finish_keepalive(&mut chat_session, &config, false).await;
+		server.finish_keepalive(&mut chat_session, false).await;
 		server.sessions.lock().await.insert(session_id.clone(), chat_session);
 	}
 	wake_inbox_monitor(session_id).await;
@@ -1321,7 +1317,7 @@ fn ensure_session_monitor(server: &ServerState, session_id: &str) {
 						}
 					};
 					let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
-					server.finish_keepalive(&mut chat_session, &config_for_role, true).await;
+					server.finish_keepalive(&mut chat_session, true).await;
 					let mut cancellation = crate::session::cancellation::SessionCancellation::new();
 					let op_rx = cancellation.new_operation();
 					let cancel_probe = op_rx.clone();
@@ -1910,9 +1906,7 @@ async fn handle_command_message(msg: CommandMessage, ws_sender: &WsSender, serve
 	let session_id = session_id.to_string();
 	let stream = turn_stream(server, &session_id, ws_sender);
 	let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
-	server
-		.finish_keepalive(&mut chat_session, &config_for_role, false)
-		.await;
+	server.finish_keepalive(&mut chat_session, false).await;
 	let mut cancellation = SessionCancellation::new();
 	let operation_rx = cancellation.new_operation();
 	let _turn = TurnGuard::register(server, &session_id, &cancellation);
@@ -2217,7 +2211,7 @@ async fn handle_user_message(msg: UserMessage, ws_sender: &WsSender, server: &Se
 	// From here on every frame is the turn's: it goes to the session's stream.
 	let stream = turn_stream(server, &session_id, ws_sender);
 	let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
-	server.finish_keepalive(&mut chat_session, &config_for_role, true).await;
+	server.finish_keepalive(&mut chat_session, true).await;
 	let mut cancellation = SessionCancellation::new();
 	// Registered for the whole frame: the handle follows every new_operation()
 	// below, so a `cancel` stops whichever turn — injected or the user's — runs.
