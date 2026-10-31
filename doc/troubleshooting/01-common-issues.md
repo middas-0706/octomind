@@ -125,7 +125,6 @@ Common causes are missing required fields, invalid TOML, or out-of-range values.
 | Every resolved model profile's `top_k` | `0`–`1000`; `0` disables it |
 | Every resolved model profile's `name` | A name accepted by the provider factory |
 | `max_session_tokens_threshold` | At most `2000000`; `0` disables the configured limit |
-| `cache_keepalive_max_idle_seconds` | At most `86400`; `0` is unbounded |
 | MCP server `timeout_seconds` | `1`–`3600` seconds |
 | Webhook `timeout` | `1`–`3600` seconds |
 

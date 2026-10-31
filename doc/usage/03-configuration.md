@@ -68,7 +68,6 @@ commit_attribution = "Co-Authored-By: Octomind <345424151+octomindat3am@users.no
 mcp_response_tokens_threshold = 20000
 max_session_tokens_threshold = 200000
 cache_keepalive_enabled = false
-cache_keepalive_max_idle_seconds = 1800
 
 enable_markdown_rendering = true
 markdown_theme = "default"

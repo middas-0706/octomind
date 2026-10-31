@@ -21,6 +21,7 @@ use super::protocol::{
 };
 use super::stream::{SessionStream, StreamSink, Streams};
 use crate::config::Config;
+use crate::session::cache_keepalive::{KeepaliveHandle, WaitKind};
 use crate::session::cancellation::{CancelHandle, SessionCancellation};
 use crate::session::chat::session::{
 	execute_api_call_and_process_response, prepare_for_api_call, run_pipe_if_enabled, setup_and_initialize_session,
@@ -52,6 +53,10 @@ type SessionLocks = Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
 
 /// Sessions that have a background monitor (see `ensure_session_monitor`).
 type Monitors = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// Reply keepalives of the sessions idle after a turn with a client that can
+/// answer, by session id (see `ServerState::start_keepalive`).
+type Keepalives = Arc<std::sync::Mutex<HashMap<String, KeepaliveHandle>>>;
 
 pub(super) const MAX_QUEUED_FRAMES: usize = 8192;
 pub(super) const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
@@ -175,6 +180,10 @@ struct ServerState {
 	/// Sessions whose background monitor runs: one each, from the session's
 	/// first load until it is unloaded.
 	monitors: Monitors,
+	/// Prompt-cache keepalives of the sessions waiting for a client's reply.
+	/// Each ends before the session's next turn, when its client leaves, or
+	/// when the session unloads.
+	keepalives: Keepalives,
 	/// Browser origins permitted to open a connection. Empty = refuse every
 	/// handshake that carries an `Origin` header.
 	allow_origins: Arc<Vec<String>>,
@@ -197,6 +206,7 @@ impl ServerState {
 			streams: Streams::default(),
 			residents: Arc::default(),
 			monitors: Arc::default(),
+			keepalives: Arc::default(),
 			allow_origins: Arc::new(allow_origins),
 			token: None,
 		}
@@ -215,6 +225,46 @@ impl ServerState {
 			session_id: session_id.to_string(),
 			committed: existing,
 		})
+	}
+
+	/// Keeps the session's prompt cache warm while its client may still reply.
+	/// Does nothing without a connected client owning the output: nobody could
+	/// answer, so a ping would only cost. Call it with the session lock held,
+	/// so a disconnect's release ([`release_ownerless_keepalive`]) cannot run
+	/// between the owner check and the handle's registration.
+	fn start_keepalive(&self, chat_session: &ChatSession, config: &Config, stream: &SessionStream) {
+		if !stream.has_live_owner() {
+			return;
+		}
+		let Some(handle) = KeepaliveHandle::spawn(chat_session, config, WaitKind::Reply) else {
+			return;
+		};
+		let session_id = chat_session.session.info.name.clone();
+		let previous = self.keepalives.lock().unwrap().insert(session_id.clone(), handle);
+		debug_assert!(
+			previous.is_none(),
+			"a turn started without finishing the session's keepalive"
+		);
+		// A disconnect's `hang_up` scans the handles without the session lock:
+		// if it ran between the owner check above and the insert, it missed
+		// this one. Its first ping is an interval away, so dropping it here
+		// stops it with nothing billed.
+		if !stream.has_live_owner() {
+			self.keepalives.lock().unwrap().remove(&session_id);
+		}
+	}
+
+	/// Ends the session's keepalive, if it has one, and folds its ping costs
+	/// into the session. `waited`: the wait ended with the turn it preceded,
+	/// not with a disconnect or an unload. Returns the ping count.
+	async fn finish_keepalive(&self, chat_session: &mut ChatSession, config: &Config, waited: bool) -> usize {
+		let session_id = chat_session.session.info.name.clone();
+		let handle = self.keepalives.lock().unwrap().remove(&session_id);
+		let Some(handle) = handle else {
+			return 0;
+		};
+		// Ping costs are banked through the session's scope-keyed spend.
+		crate::session::context::with_session_id(session_id, handle.finish(chat_session, config, waited)).await
 	}
 }
 
@@ -244,10 +294,23 @@ struct ConnCtx {
 
 impl ConnCtx {
 	/// The client is gone: no session sends to it any more — its frames are held
-	/// for the next bind.
+	/// for the next bind — and the sessions it left without an owner stop
+	/// pinging their prompt cache, since nobody can reply.
 	fn hang_up(&self, ws_sender: &WsSender) {
 		self.closed.cancel();
 		self.server.streams.detach(ws_sender);
+		let ownerless: Vec<String> = self
+			.server
+			.keepalives
+			.lock()
+			.unwrap()
+			.keys()
+			.filter(|session_id| !self.server.streams.open(session_id).has_live_owner())
+			.cloned()
+			.collect();
+		for session_id in ownerless {
+			tokio::spawn(release_ownerless_keepalive(self.server.clone(), session_id));
+		}
 	}
 }
 
@@ -1009,7 +1072,17 @@ async fn handle_close_message(
 		return Ok(());
 	};
 
-	let was_loaded = server.sessions.lock().await.remove(&session_id).is_some();
+	let unloaded = server.sessions.lock().await.remove(&session_id);
+	let was_loaded = unloaded.is_some();
+	if let Some(mut chat_session) = unloaded {
+		let config = session_config(&server.config, &server.role_configs, &chat_session).await;
+		// The session is dropped below: save the pings' cost, which no later turn will carry.
+		if server.finish_keepalive(&mut chat_session, &config, false).await > 0 {
+			if let Err(e) = chat_session.save() {
+				log_error!("Failed to save session {} after its keepalive: {}", session_id, e);
+			}
+		}
+	}
 	server.role_configs.lock().await.remove(&session_id);
 	server.residents.lock().unwrap().remove(&session_id);
 	// A later bind loads the session anew, under a new stream.
@@ -1041,6 +1114,30 @@ async fn cleanup_and_wake_monitor(session_id: &str) {
 	if let Some(notify) = inbox_notify {
 		notify.notify_one();
 	}
+}
+
+/// Stops the keepalive of a session whose client is gone. Takes the session
+/// lock like any other holder. A turn that runs meanwhile has finished the
+/// keepalive already, and a client may have bound while this waited, so both
+/// are checked again under the lock.
+async fn release_ownerless_keepalive(server: ServerState, session_id: String) {
+	{
+		let lock = get_or_create_session_lock(&session_id, &server.session_locks).await;
+		let _guard = lock.lock().await;
+		if !server.keepalives.lock().unwrap().contains_key(&session_id)
+			|| server.streams.open(&session_id).has_live_owner()
+		{
+			return;
+		}
+		let Some(mut chat_session) = server.sessions.lock().await.remove(&session_id) else {
+			return;
+		};
+		let config = session_config(&server.config, &server.role_configs, &chat_session).await;
+		log_debug!("Client left session {}: stopping its cache keepalive", session_id);
+		server.finish_keepalive(&mut chat_session, &config, false).await;
+		server.sessions.lock().await.insert(session_id.clone(), chat_session);
+	}
+	wake_inbox_monitor(session_id).await;
 }
 
 /// Get or create a per-session processing lock.
@@ -1224,6 +1321,7 @@ fn ensure_session_monitor(server: &ServerState, session_id: &str) {
 						}
 					};
 					let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
+					server.finish_keepalive(&mut chat_session, &config_for_role, true).await;
 					let mut cancellation = crate::session::cancellation::SessionCancellation::new();
 					let op_rx = cancellation.new_operation();
 					let cancel_probe = op_rx.clone();
@@ -1284,6 +1382,7 @@ fn ensure_session_monitor(server: &ServerState, session_id: &str) {
 						ws_sink,
 					))
 					.await;
+					let turn_succeeded = result.is_ok() && !cancellation.is_cancelled();
 
 					if let Err(e) = result {
 						log_debug!("WS monitor: error processing inbox message: {}", e);
@@ -1309,6 +1408,9 @@ fn ensure_session_monitor(server: &ServerState, session_id: &str) {
 						crate::session::chat::response::session_cost_payload(&mut chat_session, session_id.clone());
 					cost.cancelled = *cancel_probe.borrow();
 					emit(&ServerMessage::Cost(cost));
+					if turn_succeeded {
+						server.start_keepalive(&chat_session, &config_for_role, &stream);
+					}
 
 					// Save and put session back.
 					if let Err(e) = chat_session.save() {
@@ -1808,6 +1910,9 @@ async fn handle_command_message(msg: CommandMessage, ws_sender: &WsSender, serve
 	let session_id = session_id.to_string();
 	let stream = turn_stream(server, &session_id, ws_sender);
 	let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
+	server
+		.finish_keepalive(&mut chat_session, &config_for_role, false)
+		.await;
 	let mut cancellation = SessionCancellation::new();
 	let operation_rx = cancellation.new_operation();
 	let _turn = TurnGuard::register(server, &session_id, &cancellation);
@@ -2112,6 +2217,7 @@ async fn handle_user_message(msg: UserMessage, ws_sender: &WsSender, server: &Se
 	// From here on every frame is the turn's: it goes to the session's stream.
 	let stream = turn_stream(server, &session_id, ws_sender);
 	let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
+	server.finish_keepalive(&mut chat_session, &config_for_role, true).await;
 	let mut cancellation = SessionCancellation::new();
 	// Registered for the whole frame: the handle follows every new_operation()
 	// below, so a `cancel` stops whichever turn — injected or the user's — runs.
@@ -2281,6 +2387,9 @@ async fn handle_user_message(msg: UserMessage, ws_sender: &WsSender, server: &Se
 	cost.cancelled = cancelled;
 	cost.request_id = msg.request_id.clone();
 	let cost_msg = ServerMessage::Cost(cost);
+	if api_result.is_ok() && !cancelled {
+		server.start_keepalive(&chat_session, &config_for_role, &stream);
+	}
 
 	// Store session back and wake inbox monitor if it has pending messages.
 	server.sessions.lock().await.insert(session_id.clone(), chat_session);

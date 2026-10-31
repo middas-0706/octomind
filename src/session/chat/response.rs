@@ -20,6 +20,7 @@ pub mod tool_result_processor;
 use super::{CostTracker, MessageHandler, ToolProcessor};
 use crate::config::Config;
 use crate::providers::ThinkingBlock;
+use crate::session::cache_keepalive::{KeepaliveHandle, WaitKind};
 use crate::session::chat::assistant_output::print_assistant_response;
 use crate::session::chat::display_thinking;
 use crate::session::chat::session::ChatSession;
@@ -547,7 +548,10 @@ pub async fn process_response<S: OutputSink>(params: ResponseProcessingParams<'_
 						}));
 					}
 				}
-				let (tool_results, total_tool_time_ms) = match tool_execution::execute_tools_parallel(
+				// Keep the prompt cache warm while long tool runs execute. Finished on
+				// every path before the follow-up request, so no handle leaks.
+				let keepalive = KeepaliveHandle::spawn(params.chat_session, params.config, WaitKind::Tools);
+				let tool_run = tool_execution::execute_tools_parallel(
 					current_tool_calls.clone(),
 					&current_content,
 					params.chat_session,
@@ -556,8 +560,12 @@ pub async fn process_response<S: OutputSink>(params: ResponseProcessingParams<'_
 					operation_cancelled_clone.clone(),
 					params.mode,
 				)
-				.await
-				{
+				.await;
+				if let Some(handle) = keepalive {
+					let waited = tool_run.is_ok() && !*operation_cancelled_clone.borrow();
+					handle.finish(params.chat_session, params.config, waited).await;
+				}
+				let (tool_results, total_tool_time_ms) = match tool_run {
 					Ok(results) => results,
 					Err(e) => {
 						// Check if this was a cancellation

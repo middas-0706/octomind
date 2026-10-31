@@ -26,7 +26,7 @@ use super::layer_processor::run_pipe_if_enabled;
 use super::prompt_setup::setup_system_prompt_and_cache;
 use super::setup::setup_and_initialize_session;
 use crate::config::Config;
-use crate::session::cache_keepalive::KeepaliveHandle;
+use crate::session::cache_keepalive::{KeepaliveHandle, WaitKind};
 use crate::session::cancellation::SessionCancellation;
 use crate::session::chat::response::tool_execution::shape_background_deliveries;
 use crate::session::output::{JsonlSink, OutputMode, SilentSink};
@@ -88,37 +88,21 @@ async fn init_session_runtime(
 	})
 }
 
-/// Cancel any in-flight cache-keepalive task and fold its harvested ping costs
-/// into the session. Returns `true` when at least one ping was folded — callers
-/// that persist post-fold (session save) check this to skip a no-op write.
-///
-/// Replaces 4 near-identical inline blocks. `on_exit` selects the log wording
-/// for end-of-session drains versus mid-loop pre-turn drains.
+/// Stop any in-flight cache-keepalive task and fold its ping costs into the
+/// session. `waited` is true when the wait ended with its answer (new input
+/// arrived) so it feeds future ping budgets; false on session exit. Returns
+/// `true` when at least one ping was folded — callers that persist post-fold
+/// (session save) check this to skip a no-op write.
 async fn drain_keepalive_into_session(
 	keepalive: &mut Option<KeepaliveHandle>,
 	chat_session: &mut ChatSession,
 	config: &Config,
-	on_exit: bool,
+	waited: bool,
 ) -> bool {
 	let Some(handle) = keepalive.take() else {
 		return false;
 	};
-	let exchanges = handle.cancel().await;
-	if exchanges.is_empty() {
-		return false;
-	}
-	let (where_msg, err_msg) = if on_exit {
-		("on session exit", "Failed to track keepalive cost on exit")
-	} else {
-		("into session cost", "Failed to track keepalive cost")
-	};
-	log_debug!("Cache keepalive: folding {} ping(s) {}", exchanges.len(), where_msg);
-	for exchange in &exchanges {
-		if let Err(e) = CostTracker::track_exchange_cost(chat_session, exchange, config) {
-			log_debug!("{}: {}", err_msg, e);
-		}
-	}
-	true
+	handle.finish(chat_session, config, waited).await > 0
 }
 
 /// Apply clipboard blobs auto-attached via Ctrl+V to the active session.
@@ -435,9 +419,9 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 		let mut reply_prefill: Option<String> = None;
 
 		// Idle-time prompt cache keepalive. Set after each successful API call,
-		// taken (cancelled) at the top of the next iteration before we read
-		// fresh user input. None when keepalive is disabled, the snapshot has
-		// no cached blocks, or the resolved provider has no policy.
+		// finished as soon as the next user input arrives. None when keepalive is
+		// disabled, the snapshot has no cached blocks, or the resolved provider has
+		// no policy.
 		let mut keepalive: Option<KeepaliveHandle> = None;
 
 		// Set the thread-local config for logging macros
@@ -579,12 +563,6 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 					// Set state to reading input
 					*processing_state.lock().unwrap() = ProcessingState::ReadingInput;
 
-					// Stop any in-flight cache keepalive from the previous turn and fold
-					// its accumulated cost into the session before we read new input.
-					// Done early so the next read_user_input runs with no background
-					// pings competing for the network or rate-limit budget.
-					drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await;
-
 					// Flush any due schedule entries into the inbox so all injection sources
 					// are unified — the loop only needs to drain the inbox from here on.
 					crate::mcp::orchestration::flush_due_to_inbox(&current_config);
@@ -708,6 +686,10 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 
 					// Input is in hand — allow the turn's animation to start again.
 					crate::session::chat::get_animation_manager().resume();
+
+					// Input arrived: stop the keepalive that bridged the wait and fold its
+					// ping costs into the session before this turn adds anything.
+					drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await;
 
 					// Handle the input result with proper error recovery
 					let mut input = match input_result {
@@ -1342,14 +1324,8 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 							// Start a keepalive ping task against a frozen snapshot of
 							// the conversation. Read-only on session state — pings
 							// never mutate messages; the harvested exchanges fold into
-							// cost at the top of the next loop iteration.
-							keepalive = KeepaliveHandle::spawn(
-								&chat_session.session.messages,
-								&chat_session.model,
-								&current_config,
-								current_config.cache_keepalive_enabled,
-								std::time::Duration::from_secs(current_config.cache_keepalive_max_idle_seconds),
-							);
+							// cost once the next input arrives.
+							keepalive = KeepaliveHandle::spawn(&chat_session, &current_config, WaitKind::Reply);
 						}
 						Err(e) => {
 							// Distinguish follow-up failure (after tools executed) from initial-call
@@ -1405,7 +1381,7 @@ pub async fn run_interactive_session(args: &super::params::GenericSessionArgs, c
 
 		// Session is ending — drain any in-flight keepalive so its cost is
 		// reflected in the persisted session log.
-		if drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await {
+		if drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await {
 			if let Err(e) = chat_session.save() {
 				crate::log_debug!("session save failed: {}", e);
 			}
@@ -1731,13 +1707,7 @@ pub async fn run_interactive_session_with_input(
 					// Start a keepalive ping task while the daemon waits for the next
 					// inbox message or schedule fire. Cancelled+folded at the top of
 					// the inbox-drain loop or on exit.
-					keepalive = KeepaliveHandle::spawn(
-						&chat_session.session.messages,
-						&chat_session.model,
-						&current_config,
-						current_config.cache_keepalive_enabled,
-						std::time::Duration::from_secs(current_config.cache_keepalive_max_idle_seconds),
-					);
+					keepalive = KeepaliveHandle::spawn(&chat_session, &current_config, WaitKind::Reply);
 				}
 				Err(e) => {
 					// Kill any running async jobs on error/cancellation
@@ -1835,7 +1805,7 @@ pub async fn run_interactive_session_with_input(
 				// Stop any in-flight keepalive from the previous turn and fold
 				// its cost before we add the new user message — keeps the
 				// session log's cost ordering correct.
-				drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await;
+				drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await;
 
 				chat_session
 					.add_inbox_batch(batch, &current_config, operation_rx.clone())
@@ -1911,13 +1881,7 @@ pub async fn run_interactive_session_with_input(
 				match api_result {
 					Ok(_) => {
 						// Spawn a fresh keepalive against the post-turn snapshot.
-						keepalive = KeepaliveHandle::spawn(
-							&chat_session.session.messages,
-							&chat_session.model,
-							&current_config,
-							current_config.cache_keepalive_enabled,
-							std::time::Duration::from_secs(current_config.cache_keepalive_max_idle_seconds),
-						);
+						keepalive = KeepaliveHandle::spawn(&chat_session, &current_config, WaitKind::Reply);
 					}
 					Err(e) => {
 						log_debug!("Error processing inbox message: {}", e);
@@ -2003,7 +1967,7 @@ pub async fn run_interactive_session_with_input(
 		}
 
 		// Drain any in-flight keepalive so its cost lands in the persisted log.
-		drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, true).await;
+		drain_keepalive_into_session(&mut keepalive, &mut chat_session, &current_config, false).await;
 
 		// A finished one-shot run learns exactly as an interactive exit does: the
 		// transcript goes to the detached `octomind distill` child, so the caller

@@ -237,6 +237,12 @@ impl SessionStream {
 		self.0.lock().unwrap().set_owner(Some(sink.clone()));
 	}
 
+	/// A connected client owns the output, so a reply to the session can still
+	/// arrive.
+	pub(crate) fn has_live_owner(&self) -> bool {
+		self.0.lock().unwrap().sink.is_some()
+	}
+
 	/// Bind `sink` to the stream. Sends the bind's ack — completed with the
 	/// stream position and, for a resume, its outcome — then every frame the
 	/// resume asked for, byte-identical, then `greeting`, all before any live

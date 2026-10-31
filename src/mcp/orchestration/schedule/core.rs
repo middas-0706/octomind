@@ -227,6 +227,12 @@ pub fn has_pending_schedules() -> bool {
 	!get_store().lock().unwrap().is_empty() || super::execution::has_running()
 }
 
+/// Time until the next scheduled entry is due, if any — a wake the session
+/// knows about in advance (the cache keepalive bridges it exactly).
+pub fn next_due_in() -> Option<std::time::Duration> {
+	get_store().lock().unwrap().next_due_duration()
+}
+
 /// Returns a future that resolves when the next scheduled entry is due.
 /// Returns `futures::future::pending()` (never resolves) when the store is empty —
 /// so the select! arm is a no-op when nothing is scheduled.

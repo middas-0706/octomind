@@ -174,21 +174,6 @@ fn session_token_threshold_caps_at_two_million() {
 }
 
 #[test]
-fn cache_keepalive_idle_cap_allows_a_day_and_zero() {
-	let mut config = template_config();
-	config.cache_keepalive_max_idle_seconds = 86401;
-	assert!(config.validate_thresholds().is_err());
-
-	config.cache_keepalive_max_idle_seconds = 86400;
-	config.validate_thresholds().expect("exactly 24h must pass");
-
-	config.cache_keepalive_max_idle_seconds = 0;
-	config
-		.validate_thresholds()
-		.expect("zero means unbounded and must pass");
-}
-
-#[test]
 fn role_sampling_bounds_are_enforced_with_inclusive_boundaries() {
 	let mut config = template_config();
 	config.roles = vec![

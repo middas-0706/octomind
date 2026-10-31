@@ -12,165 +12,311 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Idle-time prompt cache keepalive.
+//! Prompt cache keepalive while the session waits.
 //!
-//! Sends a minimal `max_tokens=1` chat completion against a frozen snapshot
-//! of the conversation while the user is idle, so the provider's prompt
-//! cache TTL keeps resetting and the next real turn still hits cache.
+//! While the session waits — for the user's reply or for a long tool run —
+//! a cache pre-warm request (no output generated, only a cache read billed)
+//! replays the cached prefix so the provider's TTL keeps resetting and the
+//! next real request still hits cache.
 //!
-//! Read-only on session state: the snapshot is owned by the keepalive task
-//! and `session.messages` is never mutated by a ping. Only billing counters
-//! move (via [`crate::session::chat::CostTracker::track_exchange_cost`] when
-//! the caller folds the returned exchanges back in).
+//! How many pings to spend is an economic decision, never a fixed cap. Each
+//! ping costs one cache read of the whole prefix; letting the entry expire
+//! costs a write instead of a read of the tail that expires with it (tools,
+//! system prompt and 1h-marked messages stay warm on their own). That makes
+//! this a ski rental problem: `max_pings = (write − read) / read × tail share`
+//! is the most that can ever pay off. Within that bound the budget minimizes
+//! the expected cost over the waits this session has already seen; a known
+//! wake (a scheduled turn) is bridged exactly when it is affordable.
+//!
+//! Read-only on session state: the snapshot is owned by the keepalive task and
+//! `session.messages` is never mutated by a ping. [`KeepaliveHandle::finish`]
+//! folds ping costs and the measured wait back into the session.
 //!
 //! Provider-aware: a ping only fires when the resolved provider returns
-//! `Some(KeepalivePolicy)` from its trait method. Today that is Anthropic
-//! only. Other providers either manage cache server-side with no
-//! observable refresh primitive or have no cache at all — pinging them
-//! would just burn money. The interval comes from the provider, not from
-//! octomind's config.
+//! `Some(KeepalivePolicy)` and has pricing. Today that is Anthropic and
+//! OpenRouter Claude routes.
 
-use crate::config::Config;
+use crate::config::{Config, ModelProfile};
 use crate::providers::{ChatCompletionParams, ProviderExchange, ProviderFactory};
+use crate::session::chat::{ChatSession, CostTracker};
 use crate::session::Message;
 use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Successful pings collected while the handle was alive. Each item is one
-/// `ProviderExchange` whose `usage` field carries the cache-read /
-/// cache-write / output token counts and provider-computed cost.
-/// Folded into the session's cost tracker by the caller.
-pub type KeepaliveExchanges = Vec<ProviderExchange>;
+/// TTL marker value for the long (1h) Anthropic cache entry.
+const LONG_CACHE_TTL: &str = "1h";
 
-/// A running keepalive task. Drop without `cancel()` and the task keeps
-/// firing pings until `max_idle` elapses or the process exits — call
-/// [`KeepaliveHandle::cancel`] to stop it cleanly and harvest the
-/// accumulated exchanges for cost accounting.
+/// Prices are decimal dollars stored as binary floats: (5.00 − 0.20) / 0.20
+/// lands at 23.999…, so the floor needs this much slack to give 24.
+const PRICE_RATIO_TOLERANCE: f64 = 1e-9;
+
+/// What the session waits on while a keepalive runs. Each kind keeps its own
+/// history: how fast a user replies says nothing about how long builds take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitKind {
+	/// Waiting for the next user / client / scheduled message.
+	Reply,
+	/// Waiting for the current turn's tool calls to finish.
+	Tools,
+}
+
+/// Observed waits per kind (runtime-only, never persisted). Feeds the
+/// expected-cost budget; empty history falls back to the ski-rental bound.
+#[derive(Debug, Clone, Default)]
+pub struct WaitHistory {
+	reply: Vec<Duration>,
+	tools: Vec<Duration>,
+}
+
+impl WaitHistory {
+	pub fn record(&mut self, kind: WaitKind, wait: Duration) {
+		self.samples_mut(kind).push(wait);
+	}
+
+	pub fn samples(&self, kind: WaitKind) -> &[Duration] {
+		match kind {
+			WaitKind::Reply => &self.reply,
+			WaitKind::Tools => &self.tools,
+		}
+	}
+
+	fn samples_mut(&mut self, kind: WaitKind) -> &mut Vec<Duration> {
+		match kind {
+			WaitKind::Reply => &mut self.reply,
+			WaitKind::Tools => &mut self.tools,
+		}
+	}
+}
+
+/// A running keepalive. Finish it with [`KeepaliveHandle::finish`]: dropping
+/// it stops the pings (the cancel channel closes) but loses their cost.
 pub struct KeepaliveHandle {
 	cancel_tx: watch::Sender<bool>,
-	task: JoinHandle<KeepaliveExchanges>,
+	task: JoinHandle<Vec<ProviderExchange>>,
+	kind: WaitKind,
+	started: Instant,
 }
 
 impl KeepaliveHandle {
-	/// Spawn a keepalive task if conditions are met. Returns `None` when:
-	/// - `enabled` is false,
-	/// - the snapshot has no cached message (nothing to keep warm),
-	/// - model parsing fails,
-	/// - or the provider has no keepalive policy (e.g. OpenAI, DeepSeek).
-	///
-	/// On success the task is detached and runs until `cancel()` is called
-	/// or `max_idle` is reached.
-	/// Borrows the conversation and config: the owned snapshot is taken only
-	/// after every bail-out check passes, so a disabled keepalive (the default)
-	/// never copies the whole message history once per turn.
-	pub fn spawn(
-		messages: &[Message],
-		model: &str,
-		config: &Config,
-		enabled: bool,
-		max_idle: Duration,
-	) -> Option<Self> {
-		if !enabled {
+	/// Start a keepalive for a wait of `kind`. Returns `None` when keepalive
+	/// is disabled, nothing is cached, the session requests structured output
+	/// (the API rejects a pre-warm with an output schema), or the provider has
+	/// no keepalive policy or pricing. A zero ping budget still returns a
+	/// handle: the wait is measured either way, so the next budget learns.
+	pub fn spawn(chat_session: &ChatSession, config: &Config, kind: WaitKind) -> Option<Self> {
+		if !config.cache_keepalive_enabled || chat_session.schema.is_some() {
 			return None;
 		}
-		// No cache markers in the snapshot ⇒ no warm cache to extend.
-		if !messages.iter().any(|m| m.cached) {
-			return None;
-		}
+		let messages = &chat_session.session.messages;
+		// The ping replays exactly the prefix the last request cached: up to
+		// its newest marker. Anything after it (the assistant reply, the
+		// runtime memory pack) was never cached and would only add input.
+		let last_cached = messages.iter().rposition(|m| m.cached)?;
+		let snapshot = messages[..=last_cached].to_vec();
+		let profile = chat_session.model_profile(config);
+		let (provider, actual_model) = ProviderFactory::get_provider_for_model(&profile.model).ok()?;
+		let long_ttl = snapshot[last_cached].cache_ttl.as_deref() == Some(LONG_CACHE_TTL);
+		let policy = provider.keepalive_policy(&actual_model, long_ttl)?;
+		let pricing = provider.get_model_pricing(&actual_model)?;
 
-		let (provider, actual_model) = ProviderFactory::get_provider_for_model(model).ok()?;
-		let policy = provider.keepalive_policy(&actual_model, true)?;
-
-		let (cancel_tx, cancel_rx) = watch::channel(false);
-		let task = tokio::spawn(run(
-			messages.to_vec(),
-			model.to_string(),
-			config.clone(),
+		let penalty = rewrite_penalty_in_pings(
+			pricing.cache_write_price_per_1m,
+			pricing.cache_read_price_per_1m,
+			tail_share(&snapshot, chat_session.cached_tools.as_deref(), &profile.model),
+		);
+		let known_wake = match kind {
+			WaitKind::Reply => crate::mcp::orchestration::next_due_in(),
+			WaitKind::Tools => None,
+		};
+		let budget = ping_budget(
+			chat_session.wait_history.samples(kind),
+			known_wake,
 			policy.interval,
-			max_idle,
-			cancel_rx,
-		));
-
-		crate::log_debug!(
-			"Cache keepalive started: interval={}s, max_idle={}s",
-			policy.interval.as_secs(),
-			max_idle.as_secs()
+			penalty,
 		);
 
-		Some(Self { cancel_tx, task })
+		let (cancel_tx, cancel_rx) = watch::channel(false);
+		let ping_loop = run(snapshot, profile, config.clone(), policy.interval, budget, cancel_rx);
+		// A spawned task drops the task-local session: without it the ping
+		// would assemble the global tool list instead of this session's, and
+		// a different tools block misses the cache.
+		let session_id = crate::session::context::current_session_id();
+		let task = tokio::spawn(async move {
+			match session_id {
+				Some(id) => crate::session::context::with_session_id(id, ping_loop).await,
+				None => ping_loop.await,
+			}
+		});
+
+		crate::log_debug!(
+			"Cache keepalive started: kind={:?}, interval={}s, budget={} ping(s), rewrite penalty={:.1} ping(s)",
+			kind,
+			policy.interval.as_secs(),
+			budget,
+			penalty
+		);
+
+		Some(Self {
+			cancel_tx,
+			task,
+			kind,
+			started: Instant::now(),
+		})
 	}
 
-	/// Signal the task to stop and wait for it to finish, returning all
-	/// successful pings for the caller to attribute cost to.
-	pub async fn cancel(self) -> KeepaliveExchanges {
+	/// Stop the task and fold its ping costs into the session. `waited`
+	/// records the elapsed time as a completed wait — pass `false` when the
+	/// wait ended without its answer (disconnect, unload, session exit), so
+	/// an abandoned wait never skews the next budget. Returns the ping count.
+	pub async fn finish(self, chat_session: &mut ChatSession, config: &Config, waited: bool) -> usize {
+		let elapsed = self.started.elapsed();
 		let _ = self.cancel_tx.send(true);
-		match self.task.await {
+		let exchanges = match self.task.await {
 			Ok(exchanges) => exchanges,
 			Err(e) => {
 				crate::log_debug!("Cache keepalive task join error: {}", e);
 				Vec::new()
 			}
+		};
+		if waited {
+			chat_session.wait_history.record(self.kind, elapsed);
 		}
+		for exchange in &exchanges {
+			if let Err(e) = CostTracker::track_exchange_cost(chat_session, exchange, config) {
+				crate::log_debug!("Failed to track keepalive cost: {}", e);
+			}
+		}
+		crate::log_debug!(
+			"Cache keepalive finished: kind={:?}, waited={}s, {} ping(s)",
+			self.kind,
+			elapsed.as_secs(),
+			exchanges.len()
+		);
+		exchanges.len()
 	}
 }
 
+/// Share of the pinged prefix that an expiry would actually re-write. A ping
+/// reads the whole prefix, but the tools, the system prompt and any 1h-marked
+/// message stay warm in their own long entry; only the tail after the last
+/// long boundary expires with the newest marker. Without cached tool
+/// definitions the tools are left out of both sides, which overstates the
+/// share slightly (more pings), never understates it.
+fn tail_share(snapshot: &[Message], tools: Option<&[crate::mcp::McpFunction]>, model: &str) -> f64 {
+	let newest = snapshot.len() - 1;
+	// The provider gives the cached system prompt the long TTL on every request.
+	let long_end = snapshot[..newest]
+		.iter()
+		.rposition(|m| m.cache_ttl.as_deref() == Some(LONG_CACHE_TTL))
+		.or_else(|| (snapshot[0].role == "system" && snapshot[0].cached).then_some(0))
+		.map_or(0, |i| i + 1);
+	let total = crate::session::estimate_sent_full_context_tokens(snapshot, tools, model) as f64;
+	let long = crate::session::estimate_sent_full_context_tokens(&snapshot[..long_end], tools, model) as f64;
+	if total <= 0.0 {
+		return 0.0;
+	}
+	((total - long) / total).clamp(0.0, 1.0)
+}
+
+/// What letting the entry expire costs, in pings. A ping is one cache read of
+/// the whole prefix; an expiry makes the next request write the tail instead
+/// of reading it.
+fn rewrite_penalty_in_pings(write_price: f64, read_price: f64, tail_share: f64) -> f64 {
+	if read_price <= 0.0 {
+		return 0.0;
+	}
+	((write_price - read_price) / read_price * tail_share).max(0.0)
+}
+
+/// Ski-rental bound: the most pings that can beat the rewrite.
+fn max_pings(penalty: f64) -> u32 {
+	(penalty + PRICE_RATIO_TOLERANCE).floor() as u32
+}
+
+/// Pings needed to keep the entry warm until `wait` ends. The interval is
+/// below the TTL, so the entry outlives the last ping by at least one gap.
+fn pings_to_bridge(wait: Duration, interval: Duration) -> u32 {
+	(wait.as_millis() / interval.as_millis().max(1)) as u32
+}
+
+/// Pings to spend on this wait, in `0..=max_pings(penalty)`. A known wake
+/// that is affordable is bridged exactly — a turn is certain then. Otherwise
+/// pick the budget with the lowest total cost over past waits of this kind,
+/// in pings: a wait bridged within the budget costs its pings, a longer one
+/// costs the whole budget plus the rewrite penalty. No history yet means the
+/// ski-rental bound, which is never worse than twice the optimum.
+fn ping_budget(history: &[Duration], known_wake: Option<Duration>, interval: Duration, penalty: f64) -> u32 {
+	let max = max_pings(penalty);
+	if let Some(wake) = known_wake {
+		let needed = pings_to_bridge(wake, interval);
+		if needed <= max {
+			return needed;
+		}
+	}
+	if history.is_empty() {
+		return max;
+	}
+	let expected_cost = |budget: u32| -> f64 {
+		history
+			.iter()
+			.map(|wait| {
+				let needed = pings_to_bridge(*wait, interval);
+				if needed <= budget {
+					f64::from(needed)
+				} else {
+					f64::from(budget) + penalty
+				}
+			})
+			.sum()
+	};
+	// `min_by` keeps the first minimum, so ties choose the smaller budget.
+	(0..=max)
+		.min_by(|a, b| expected_cost(*a).total_cmp(&expected_cost(*b)))
+		.unwrap_or(0)
+}
+
 async fn run(
-	messages: Vec<Message>,
-	model: String,
+	snapshot: Vec<Message>,
+	profile: ModelProfile,
 	config: Config,
 	interval: Duration,
-	max_idle: Duration,
+	budget: u32,
 	mut cancel_rx: watch::Receiver<bool>,
-) -> KeepaliveExchanges {
+) -> Vec<ProviderExchange> {
 	let mut exchanges = Vec::new();
-	let started = Instant::now();
-	let max_idle_enabled = max_idle > Duration::ZERO;
-	let idle_deadline = started + max_idle;
 
-	loop {
-		// Stop if max_idle has elapsed (cheap session-abandoned guard).
-		if max_idle_enabled && Instant::now() >= idle_deadline {
-			crate::log_debug!("Cache keepalive: max_idle ({:?}) reached, stopping", max_idle);
-			break;
-		}
-
-		// Wait one interval, with cancel as the override. The wait is capped
-		// at the idle deadline so the guard above always gets to run, even
-		// when interval is longer than the remaining idle budget.
-		let wait = if max_idle_enabled {
-			interval.min(idle_deadline.saturating_duration_since(Instant::now()))
-		} else {
-			interval
-		};
-		let sleep = tokio::time::sleep(wait);
-		tokio::pin!(sleep);
+	for _ in 0..budget {
 		tokio::select! {
-			_ = &mut sleep => {}
+			_ = tokio::time::sleep(interval) => {}
 			res = cancel_rx.changed() => {
 				// channel closed or cancel signalled
 				if res.is_err() || *cancel_rx.borrow() {
 					break;
 				}
-				continue;
 			}
 		}
 
-		// Re-check cancel right before firing — user may have started
-		// typing during the interval and we don't want a ping racing the
-		// real next turn.
+		// Re-check right before firing: a ping must never race the real
+		// request that ended the wait.
 		if *cancel_rx.borrow() {
 			break;
 		}
 
-		// Best-effort ping. Failures (network, rate limit, etc.) are
-		// logged at debug level and silently retried next interval —
-		// keepalive is non-essential and must never abort the session.
-		match send_ping(&messages, &model, &config, cancel_rx.clone()).await {
+		// Best-effort: failures are logged and the next interval retries.
+		// A keepalive must never abort the session.
+		match send_ping(&snapshot, &profile, &config, cancel_rx.clone()).await {
 			Ok(exchange) => {
-				crate::log_debug!("Cache keepalive ping ok ({}s elapsed)", started.elapsed().as_secs());
+				// A ping that read nothing re-wrote the prefix at the write
+				// price: its request differs from the real one. Stop instead of
+				// paying that again every interval.
+				let missed = exchange.usage.as_ref().is_none_or(|u| u.cache_read_tokens == 0);
 				exchanges.push(exchange);
+				if missed {
+					crate::log_info!("Cache keepalive: ping missed the cache, stopping");
+					break;
+				}
 			}
 			Err(e) => {
 				crate::log_debug!("Cache keepalive ping failed: {}", e);
@@ -183,23 +329,31 @@ async fn run(
 
 async fn send_ping(
 	messages: &[Message],
-	model: &str,
+	profile: &ModelProfile,
 	config: &Config,
 	cancel_rx: watch::Receiver<bool>,
 ) -> Result<ProviderExchange> {
-	let (provider, actual_model) = ProviderFactory::get_provider_for_model(model)?;
+	let (provider, actual_model) = ProviderFactory::get_provider_for_model(&profile.model)?;
 
-	// max_tokens=1 is the whole point: cheapest valid completion that still
-	// triggers a prompt cache read (which resets the TTL on the cached
-	// blocks). Sampling params are irrelevant when generating a single token
-	// but must be valid; defaults match the provider's "no preference" path.
-	let chat_params = ChatCompletionParams::new(messages, &actual_model, 0.0, 1.0, 1, 1, config)
-		.with_max_retries(0)
-		.with_cancellation_token(cancel_rx)
-		.with_vision(crate::session::model_utils::provider_supports_vision(
-			provider.as_ref(),
-			&actual_model,
-		));
+	// Same model, effort, tools and vision as the real request: any of them
+	// differing changes the cached prefix and the ping would miss.
+	let chat_params = ChatCompletionParams::new(
+		messages,
+		&actual_model,
+		profile.temperature,
+		profile.top_p,
+		profile.top_k,
+		profile.max_tokens,
+		config,
+	)
+	.with_max_retries(0)
+	.with_cancellation_token(cancel_rx)
+	.with_reasoning_effort(profile.reasoning_effort)
+	.with_vision(crate::session::model_utils::provider_supports_vision(
+		provider.as_ref(),
+		&actual_model,
+	))
+	.with_cache_prewarm();
 
 	let octolib_params = chat_params
 		.to_octolib_params(provider.name())

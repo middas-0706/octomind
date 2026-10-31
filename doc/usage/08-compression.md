@@ -98,17 +98,21 @@ a fourth model purpose. The shipped profile uses `octohub:auto`, and omitted ove
 
 ## Configure Cache Keepalive
 
-When you walk away after the AI replies, the prompt cache TTL counts down and the next turn may miss cache. Cache
-keepalive sends minimal `max_tokens = 1` idle pings against a frozen snapshot of the conversation. Put these root
-fields before any table headers:
+When you walk away after the AI replies, or while a long tool runs, the prompt cache TTL counts down and the next turn
+may miss cache. Cache keepalive sends cache pre-warm pings (`max_tokens: 0`, cache read only, no output) against a
+frozen snapshot of the conversation. Put this root field before any table headers:
 
 ```toml
-cache_keepalive_enabled = true           # opt in; shipped default is false
-cache_keepalive_max_idle_seconds = 1800  # stop pinging 30 min after last activity (0 = until session ends)
+cache_keepalive_enabled = true  # opt in; shipped default is false
 ```
 
 - Only models whose provider returns a keepalive policy are pinged; the runtime skips other models.
-- The ping **interval comes from the provider**, not from config.
+- The ping **interval is 0.9 × the TTL of the newest cache marker** (270s for the 5m conversation cache), not a config
+  value.
+- The stop rule is derived from model pricing and the session's observed waits (ski-rental), bounded by
+  `(cache_write − cache_read) / cache_read` pings: about 24 pings, roughly 108 min, on Opus/Sonnet 5.5. A known
+  scheduled wake is bridged exactly when affordable.
+- A ping that misses the cache stops the keepalive.
 - Pings only fire when the snapshot actually has a cached message (otherwise there is nothing to keep warm).
 - Each ping costs cache-read tokens; those costs are folded back into the session cost.
 

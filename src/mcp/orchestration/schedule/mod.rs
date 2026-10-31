@@ -18,5 +18,5 @@ pub mod storage;
 
 pub use core::{
 	execute_schedule_tool, flush_due_to_inbox, flush_idle_to_inbox, get_schedule_function, has_pending_idle_schedules,
-	has_pending_schedules, is_session_idle, next_schedule_sleep,
+	has_pending_schedules, is_session_idle, next_due_in, next_schedule_sleep,
 };

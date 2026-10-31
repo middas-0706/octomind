@@ -39,6 +39,7 @@ use tokio_util::task::TaskTracker;
 use crate::config::mcp::McpServerConfig;
 use crate::config::{Config, ReasoningEffortConfig};
 use crate::mcp::elicitation::Answerer;
+use crate::session::cache_keepalive::{KeepaliveHandle, WaitKind};
 use crate::session::cancellation::SessionCancellation;
 use crate::session::chat::session::commands::CopyScope;
 use crate::session::chat::session::{
@@ -192,6 +193,10 @@ pub struct OctomindAgent {
 	session_locks: super::SessionLocks,
 	/// Active cancellation handles keyed by ACP session_id
 	cancellations: Rc<RefCell<HashMap<String, SessionCancellation>>>,
+	/// Prompt-cache keepalives for sessions idle in `sessions`, keyed by ACP
+	/// session_id. Finished (with the session taken out of the map) before the
+	/// next AI turn and on connection end.
+	keepalives: Rc<RefCell<HashMap<String, KeepaliveHandle>>>,
 	/// Connection back to the client — used to send session/update notifications.
 	/// `ConnectionTo<Client>` is `Clone` and channel-backed, so notifications can be
 	/// emitted from any task on the LocalSet (streaming forwarders, inbox monitor).
@@ -223,6 +228,7 @@ impl OctomindAgent {
 			sessions: Rc::new(RefCell::new(HashMap::new())),
 			session_locks: Rc::new(RefCell::new(HashMap::new())),
 			cancellations: Rc::new(RefCell::new(HashMap::new())),
+			keepalives: Rc::new(RefCell::new(HashMap::new())),
 			conn: Rc::new(RefCell::new(None)),
 			idle_notify: Rc::new(tokio::sync::Notify::new()),
 			pending_name: RefCell::new(options.name),
@@ -257,6 +263,27 @@ impl OctomindAgent {
 				mcp_servers,
 				info: &chat_session.session.info,
 			});
+		}
+	}
+
+	/// Connection ended: stop every idle-session keepalive and fold its ping costs
+	/// into the session before telemetry reads them. The wait never got its answer,
+	/// so it is not recorded.
+	async fn finish_keepalives(&self) {
+		let handles: Vec<_> = self.keepalives.borrow_mut().drain().collect();
+		let config = self.config.borrow().get_merged_config_for_role(&self.role);
+		for (session_id, handle) in handles {
+			// A handle exists only while its session sits idle in the map.
+			let entry = self.sessions.borrow_mut().remove(&session_id);
+			let Some((mut chat_session, cwd)) = entry else {
+				log_debug!("ACP: keepalive for {} outlived its session", session_id);
+				continue;
+			};
+			handle.finish(&mut chat_session, &config, false).await;
+			if let Err(e) = chat_session.save() {
+				log_debug!("ACP: failed to save session after keepalive: {}", e);
+			}
+			self.sessions.borrow_mut().insert(session_id, (chat_session, cwd));
 		}
 	}
 
@@ -697,6 +724,7 @@ impl OctomindAgent {
 		let conn = Rc::clone(&self.conn);
 		let support = self.elicitation_support.get();
 		let idle_notify = Rc::clone(&self.idle_notify);
+		let keepalives = Rc::clone(&self.keepalives);
 
 		tokio::task::spawn_local(async move {
 			log_debug!("ACP: inbox monitor started for session: {}", session_id);
@@ -766,6 +794,10 @@ impl OctomindAgent {
 						// Restore working directory for tool calls.
 						crate::mcp::set_session_working_directory(session_cwd.clone());
 						let config_for_role = config.borrow().get_merged_config_for_role(&role);
+						let keepalive = keepalives.borrow_mut().remove(&session_id);
+						if let Some(handle) = keepalive {
+							handle.finish(&mut chat_session, &config_for_role, true).await;
+						}
 
 						let op_rx = cancellations
 							.borrow_mut()
@@ -844,7 +876,7 @@ impl OctomindAgent {
 							&mut chat_session,
 							&config_for_role,
 							&role,
-							op_rx,
+							op_rx.clone(),
 							OutputMode::WebSocket,
 							ws_sink,
 						))
@@ -857,8 +889,19 @@ impl OctomindAgent {
 							log_error!("ACP monitor: failed to save session: {}", error);
 						}
 
+						// A cancelled turn means the user moved on, so nothing to keep warm.
+						let turn_completed = result.is_ok() && !*op_rx.borrow();
 						if let Err(e) = result {
 							log_debug!("ACP monitor: error processing inbox message: {}", e);
+						}
+
+						// Idle again until the next schedule or inbox wake.
+						if turn_completed {
+							if let Some(handle) =
+								KeepaliveHandle::spawn(&chat_session, &config_for_role, WaitKind::Reply)
+							{
+								keepalives.borrow_mut().insert(session_id.clone(), handle);
+							}
 						}
 
 						// Put session back.
@@ -1320,6 +1363,13 @@ impl OctomindAgent {
 
 			let config_for_role = self.config.borrow().get_merged_config_for_role(&self.role);
 
+			// The wait for this prompt is over; fold the keepalive's ping costs in before
+			// the next AI turn starts.
+			let keepalive = self.keepalives.borrow_mut().remove(&session_id);
+			if let Some(handle) = keepalive {
+				handle.finish(&mut chat_session, &config_for_role, true).await;
+			}
+
 			// Get or create cancellation for this session
 			let mut cancellation = self.cancellations.borrow_mut().remove(&session_id).unwrap_or_default();
 			cancellation.reset();
@@ -1638,6 +1688,14 @@ impl OctomindAgent {
 			// resume show real stats. Mirrors the WebSocket server pattern.
 			if let Err(e) = chat_session.save() {
 				log_debug!("ACP: failed to save session after prompt: {}", e);
+			}
+
+			// An idle wait follows a finished turn: keep the prompt cache warm until the
+			// next prompt or inbox turn. A cancelled turn means the user moved on.
+			if api_result.is_ok() && !*operation_rx.borrow() {
+				if let Some(handle) = KeepaliveHandle::spawn(&chat_session, &config_for_role, WaitKind::Reply) {
+					self.keepalives.borrow_mut().insert(session_id.clone(), handle);
+				}
 			}
 
 			// Put session back and wake inbox monitor if it has pending messages.
@@ -2048,6 +2106,7 @@ pub(super) async fn serve(config: Config, role: String, options: crate::acp::Acp
 	if let Err(e) = result {
 		log_debug!("ACP: connection ended: {}", e);
 	}
+	agent.finish_keepalives().await;
 	agent.record_telemetry();
 	Ok(())
 }

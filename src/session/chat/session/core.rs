@@ -255,6 +255,10 @@ pub struct ChatSession {
 	/// `None` until the first sample; a new process (each `-r` turn) starts
 	/// uncalibrated and converges within a call or two.
 	pub prompt_calibration: Option<f64>,
+	/// Waits the cache keepalive has measured, per kind (runtime-only): the
+	/// next keepalive budgets its pings from how long this session's waits
+	/// actually ran.
+	pub wait_history: crate::session::cache_keepalive::WaitHistory,
 	/// Optional JSON schema for structured output (set via WebSocket/ACP protocol)
 	pub schema: Option<serde_json::Value>,
 	/// Critical knowledge entries extracted from compressions — persisted across
@@ -475,6 +479,7 @@ impl ChatSession {
 			cached_tools: None,          // Initialize tool cache (populated on first use)
 			fold_job: None,
 			prompt_calibration: None,
+			wait_history: Default::default(),
 			fold_cooldown_until_call: 0,
 			fold_deferral: None,
 			schema: None, // Schema set later via CLI override
@@ -693,6 +698,7 @@ impl ChatSession {
 						cached_tools: None,         // Initialize tool cache (populated on first use)
 						fold_job: None,
 						prompt_calibration: None,
+						wait_history: Default::default(),
 						fold_cooldown_until_call: 0,
 						fold_deferral: None,
 						schema: None,                   // Schema applied after init via CLI override
@@ -1522,6 +1528,7 @@ impl ChatSession {
 			cached_tools: None,
 			fold_job: None,
 			prompt_calibration: None,
+			wait_history: Default::default(),
 			fold_cooldown_until_call: 0,
 			fold_deferral: None,
 			schema: None,

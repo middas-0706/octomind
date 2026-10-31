@@ -370,12 +370,6 @@ pub struct Config {
 	// `Some` are pinged (currently Anthropic). The interval comes from the
 	// provider, not from this config — it knows its own TTL.
 	pub cache_keepalive_enabled: bool,
-
-	// Cap on how long pings continue after the last user activity.
-	// Past this, the cache is left to expire so an abandoned session doesn't
-	// keep billing forever. Set to 0 to disable the cap (not recommended for
-	// daemon mode).
-	pub cache_keepalive_max_idle_seconds: u64,
 	pub enable_markdown_rendering: bool,
 	// Markdown theme for styling
 	pub markdown_theme: String,

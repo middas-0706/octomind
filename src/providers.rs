@@ -124,6 +124,9 @@ pub struct ChatCompletionParams<'a> {
 	/// Where this call originates (main | supervisor | compression) — becomes
 	/// the `X-Model-Purpose` header. Defaults to Main.
 	pub purpose: ModelPurpose,
+	/// Cache pre-warm request (keepalive): refresh the prompt cache TTL without
+	/// generating output. Only providers with a keepalive policy honor it.
+	pub cache_prewarm: bool,
 }
 
 impl<'a> ChatCompletionParams<'a> {
@@ -162,6 +165,7 @@ impl<'a> ChatCompletionParams<'a> {
 			tools: true,
 			vision: true,
 			purpose: ModelPurpose::default(),
+			cache_prewarm: false,
 		}
 	}
 
@@ -227,6 +231,12 @@ impl<'a> ChatCompletionParams<'a> {
 		self
 	}
 
+	/// Send as a cache pre-warm: bills the cache read only, no output.
+	pub fn with_cache_prewarm(mut self) -> Self {
+		self.cache_prewarm = true;
+		self
+	}
+
 	/// Convert to octolib ChatCompletionParams with MCP tools
 	pub async fn to_octolib_params(
 		&self,
@@ -285,6 +295,7 @@ impl<'a> ChatCompletionParams<'a> {
 		.with_request_timeout(self.request_timeout)
 		.with_stream_timeout(self.stream_timeout)
 		.with_long_cache(true)
+		.with_cache_prewarm(self.cache_prewarm)
 		.with_reasoning_effort(
 			self.reasoning_effort
 				.unwrap_or(self.config.reasoning_effort)

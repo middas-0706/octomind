@@ -60,7 +60,6 @@ has accrued since the current user request began. Setting either threshold to `0
 max_session_spending_threshold = 1.0
 max_request_spending_threshold = 0.10
 cache_keepalive_enabled = false
-cache_keepalive_max_idle_seconds = 1800
 auto_capabilities = false
 
 [model]
@@ -231,8 +230,8 @@ independent external services also do not become part of a shared hard ceiling.
 - With your own OpenAI credential, check `test -n "$OPENAI_API_KEY"` and use `openai:gpt-5.6-sol` as the role model
   name or the `"spend:brief"` mapping. Follow [provider setup](../usage/04-providers.md); compare measured reports.
 - Enable supervision for tasks that need completion checks, then include its calls in your spending comparison.
-- Enable `cache_keepalive_enabled = true` only when you want supported-provider idle refreshes. Keep a finite
-  `cache_keepalive_max_idle_seconds`; `0` removes that idle cutoff. Providers without a keepalive policy are skipped.
+- Enable `cache_keepalive_enabled = true` only when you want supported-provider cache refreshes; the ping budget is
+  derived from model pricing and stops on its own. Providers without a keepalive policy are skipped.
 
 ## Troubleshooting
 
