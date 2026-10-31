@@ -22,15 +22,24 @@
 //! How many pings to spend is an economic decision, never a fixed cap. Each
 //! ping costs one cache read of the whole prefix; letting the entry expire
 //! costs a write instead of a read of the tail that expires with it (tools,
-//! system prompt and 1h-marked messages stay warm on their own). That makes
-//! this a ski rental problem: `max_pings = (write − read) / read × tail share`
-//! is the most that can ever pay off. Within that bound the budget minimizes
-//! the expected cost over the waits this session has already seen; a known
-//! wake (a scheduled turn) is bridged exactly when it is affordable.
+//! system prompt and 1h-marked messages stay warm on their own). In pings,
+//! that penalty is `B = (write − read) / read × tail share`, and `⌊B⌋` is the
+//! most that can ever pay off.
+//!
+//! Within that bound the budget minimizes the expected cost under this
+//! session's own wait rhythm. Each ping interval `j` has a reply hazard `h_j`
+//! (the chance the wait ends in it, given it lasted that long), estimated
+//! from past waits of the same kind — answered and cut-short ones alike — and
+//! shrunk toward the session's pooled rate so a few samples cannot overrule
+//! it. With `S_j` the chance of still waiting when interval `j` starts:
+//! `E[cost(n)] = Σ_{j=1..n} S_j + B · S_{n+1}`, so the n-th ping pays exactly
+//! when `B · h_n > 1`. A known wake (a scheduled turn) is bridged exactly when
+//! affordable, and a prefix the next request replaces anyway (a pending or
+//! due compression) is never pinged.
 //!
 //! Read-only on session state: the snapshot is owned by the keepalive task and
 //! `session.messages` is never mutated by a ping. [`KeepaliveHandle::finish`]
-//! folds ping costs and the measured wait back into the session.
+//! bills the pings and records the measured wait.
 //!
 //! Provider-aware: a ping only fires when the resolved provider returns
 //! `Some(KeepalivePolicy)` and has pricing. Today that is Anthropic and
@@ -41,6 +50,7 @@ use crate::providers::{ChatCompletionParams, ProviderExchange, ProviderFactory};
 use crate::session::chat::ChatSession;
 use crate::session::Message;
 use anyhow::Result;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -52,39 +62,79 @@ const LONG_CACHE_TTL: &str = "1h";
 /// lands at 23.999…, so the floor needs this much slack to give 24.
 const PRICE_RATIO_TOLERANCE: f64 = 1e-9;
 
+/// Jeffreys prior on the session's pooled reply rate: half a reply per
+/// interval. With no history every interval reads as a coin flip, which makes
+/// the budget the ski-rental bound — never worse than twice the optimum.
+const PRIOR_REPLIES: f64 = 0.5;
+const PRIOR_INTERVALS: f64 = 1.0;
+
+/// Weight, in waits, of the pooled rate an interval's own estimate is shrunk
+/// toward: one pseudo-wait, so measured waits overrule it as soon as there
+/// are any, yet an interval no wait has reached still reads the session's
+/// rhythm instead of a coin flip.
+const POOLED_RATE_WEIGHT: f64 = 1.0;
+
+/// Recency half-life of a measured wait, in waits. A long session drifts —
+/// focused stretches with quick replies, then breaks — so the estimate tracks
+/// the current phase: the wait eight waits back counts half the latest one.
+const WAIT_HALF_LIFE: f64 = 8.0;
+
+/// Waits kept per kind: past four half-lives a wait weighs under 1/16 and no
+/// longer moves the estimate.
+const MAX_WAITS: usize = 32;
+
 /// What the session waits on while a keepalive runs. Each kind keeps its own
 /// history: how fast a user replies says nothing about how long builds take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitKind {
-	/// Waiting for the next user / client / scheduled message.
+	/// Waiting for the next user / client message.
 	Reply,
+	/// Waiting with work in flight (tap runs, detached shell or agent jobs,
+	/// running scheduled tools): a result is certain to come back. Chosen by
+	/// [`KeepaliveHandle::spawn`] for a `Reply` wait while the session is busy.
+	Background,
 	/// Waiting for the current turn's tool calls to finish.
 	Tools,
 }
 
-/// Observed waits per kind (runtime-only, never persisted). Feeds the
-/// expected-cost budget; empty history falls back to the ski-rental bound.
+/// One measured wait: how long it ran, and whether it ended with what it
+/// waited for. A cut-short wait (session exit, client gone) still says the
+/// answer took at least that long.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Wait {
+	pub length: Duration,
+	pub answered: bool,
+}
+
+/// Measured waits per kind, newest last (runtime-only, never persisted).
 #[derive(Debug, Clone, Default)]
 pub struct WaitHistory {
-	reply: Vec<Duration>,
-	tools: Vec<Duration>,
+	reply: VecDeque<Wait>,
+	background: VecDeque<Wait>,
+	tools: VecDeque<Wait>,
 }
 
 impl WaitHistory {
-	pub fn record(&mut self, kind: WaitKind, wait: Duration) {
-		self.samples_mut(kind).push(wait);
+	pub fn record(&mut self, kind: WaitKind, length: Duration, answered: bool) {
+		let waits = self.samples_mut(kind);
+		waits.push_back(Wait { length, answered });
+		if waits.len() > MAX_WAITS {
+			waits.pop_front();
+		}
 	}
 
-	pub fn samples(&self, kind: WaitKind) -> &[Duration] {
+	pub fn samples(&self, kind: WaitKind) -> &VecDeque<Wait> {
 		match kind {
 			WaitKind::Reply => &self.reply,
+			WaitKind::Background => &self.background,
 			WaitKind::Tools => &self.tools,
 		}
 	}
 
-	fn samples_mut(&mut self, kind: WaitKind) -> &mut Vec<Duration> {
+	fn samples_mut(&mut self, kind: WaitKind) -> &mut VecDeque<Wait> {
 		match kind {
 			WaitKind::Reply => &mut self.reply,
+			WaitKind::Background => &mut self.background,
 			WaitKind::Tools => &mut self.tools,
 		}
 	}
@@ -109,6 +159,10 @@ impl KeepaliveHandle {
 		if !config.cache_keepalive_enabled || chat_session.schema.is_some() {
 			return None;
 		}
+		let kind = match kind {
+			WaitKind::Reply if !crate::mcp::orchestration::is_session_idle() => WaitKind::Background,
+			other => other,
+		};
 		let messages = &chat_session.session.messages;
 		// The ping replays exactly the prefix the last request cached: up to
 		// its newest marker. Anything after it (the assistant reply, the
@@ -127,15 +181,26 @@ impl KeepaliveHandle {
 			tail_share(&snapshot, chat_session.cached_tools.as_deref(), &profile.model),
 		);
 		let known_wake = match kind {
-			WaitKind::Reply => crate::mcp::orchestration::next_due_in(),
+			WaitKind::Reply | WaitKind::Background => crate::mcp::orchestration::next_due_in(),
 			WaitKind::Tools => None,
 		};
-		let budget = ping_budget(
-			chat_session.wait_history.samples(kind),
-			known_wake,
-			policy.interval,
-			penalty,
+		// A prefix the next request rewrites anyway (a fold or a trim) has
+		// nothing left to save: keep measuring the wait, send nothing.
+		let prefix_replaced = crate::session::chat::conversation_compression::replaces_prefix_on_next_request(
+			chat_session,
+			config,
+			kind == WaitKind::Reply,
 		);
+		let budget = if prefix_replaced {
+			0
+		} else {
+			ping_budget(
+				chat_session.wait_history.samples(kind),
+				known_wake,
+				policy.interval,
+				penalty,
+			)
+		};
 
 		let (cancel_tx, cancel_rx) = watch::channel(false);
 		let ping_loop = run(snapshot, profile, config.clone(), policy.interval, budget, cancel_rx);
@@ -151,11 +216,12 @@ impl KeepaliveHandle {
 		});
 
 		crate::log_debug!(
-			"Cache keepalive started: kind={:?}, interval={}s, budget={} ping(s), rewrite penalty={:.1} ping(s)",
+			"Cache keepalive started: kind={:?}, interval={}s, budget={} ping(s), rewrite penalty={:.1} ping(s), prefix replaced next={}",
 			kind,
 			policy.interval.as_secs(),
 			budget,
-			penalty
+			penalty,
+			prefix_replaced
 		);
 
 		Some(Self {
@@ -166,11 +232,11 @@ impl KeepaliveHandle {
 		})
 	}
 
-	/// Stop the task and fold its ping costs into the session. `waited`
-	/// records the elapsed time as a completed wait — pass `false` when the
-	/// wait ended without its answer (disconnect, unload, session exit), so
-	/// an abandoned wait never skews the next budget. Returns the ping count.
-	pub async fn finish(self, chat_session: &mut ChatSession, waited: bool) -> usize {
+	/// Stop the task, bill its pings to the session and record the wait.
+	/// `answered`: the wait ended with what it waited for (input arrived,
+	/// tools finished) rather than being cut short (disconnect, unload,
+	/// session exit). Both kinds feed the next budget. Returns the ping count.
+	pub async fn finish(self, chat_session: &mut ChatSession, answered: bool) -> usize {
 		let elapsed = self.started.elapsed();
 		let _ = self.cancel_tx.send(true);
 		let exchanges = match self.task.await {
@@ -180,15 +246,14 @@ impl KeepaliveHandle {
 				Vec::new()
 			}
 		};
-		if waited {
-			chat_session.wait_history.record(self.kind, elapsed);
-		}
+		chat_session.wait_history.record(self.kind, elapsed, answered);
 		bill_pings(&mut chat_session.session.info, &exchanges);
 		chat_session.estimated_cost = chat_session.session.info.total_cost;
 		crate::log_debug!(
-			"Cache keepalive finished: kind={:?}, waited={}s, {} ping(s), session_total=${:.5}",
+			"Cache keepalive finished: kind={:?}, waited={}s, answered={}, {} ping(s), session_total=${:.5}",
 			self.kind,
 			elapsed.as_secs(),
+			answered,
 			exchanges.len(),
 			chat_session.session.info.total_cost
 		);
@@ -251,11 +316,11 @@ fn pings_to_bridge(wait: Duration, interval: Duration) -> u32 {
 
 /// Pings to spend on this wait, in `0..=max_pings(penalty)`. A known wake
 /// that is affordable is bridged exactly — a turn is certain then. Otherwise
-/// pick the budget with the lowest total cost over past waits of this kind,
-/// in pings: a wait bridged within the budget costs its pings, a longer one
-/// costs the whole budget plus the rewrite penalty. No history yet means the
-/// ski-rental bound, which is never worse than twice the optimum.
-fn ping_budget(history: &[Duration], known_wake: Option<Duration>, interval: Duration, penalty: f64) -> u32 {
+/// the budget minimizes `E[cost(n)] = Σ_{j=1..n} S_j + B · S_{n+1}`: ping `j`
+/// goes out only while the wait is still open at its interval, and the
+/// rewrite is paid only when the wait outlasts the last ping's coverage.
+/// Ties choose the smaller budget.
+fn ping_budget(history: &VecDeque<Wait>, known_wake: Option<Duration>, interval: Duration, penalty: f64) -> u32 {
 	let max = max_pings(penalty);
 	if let Some(wake) = known_wake {
 		let needed = pings_to_bridge(wake, interval);
@@ -263,26 +328,50 @@ fn ping_budget(history: &[Duration], known_wake: Option<Duration>, interval: Dur
 			return needed;
 		}
 	}
-	if history.is_empty() {
-		return max;
+	// survival[j]: the chance the wait is still open when interval j starts.
+	let mut survival = vec![1.0];
+	let mut open = 1.0;
+	for hazard in interval_hazards(history, interval, max) {
+		open *= 1.0 - hazard;
+		survival.push(open);
 	}
-	let expected_cost = |budget: u32| -> f64 {
-		history
-			.iter()
-			.map(|wait| {
-				let needed = pings_to_bridge(*wait, interval);
-				if needed <= budget {
-					f64::from(needed)
-				} else {
-					f64::from(budget) + penalty
-				}
-			})
-			.sum()
-	};
-	// `min_by` keeps the first minimum, so ties choose the smaller budget.
-	(0..=max)
+	let expected_cost = |budget: usize| survival[1..=budget].iter().sum::<f64>() + penalty * survival[budget + 1];
+	(0..=max as usize)
 		.min_by(|a, b| expected_cost(*a).total_cmp(&expected_cost(*b)))
-		.unwrap_or(0)
+		.unwrap_or(0) as u32
+}
+
+/// Reply hazard of each ping interval `0..=max`: replies that landed in it
+/// over waits that reached it, recency-weighted and shrunk toward the
+/// session's pooled rate (replies per interval waited, over every past wait
+/// of this kind). A cut-short wait counts as waited up to where it stopped,
+/// never as a reply — dropping it would make waits look shorter than they are.
+fn interval_hazards(history: &VecDeque<Wait>, interval: Duration, max: u32) -> Vec<f64> {
+	let slots = max as usize + 1;
+	let mut reached = vec![0.0; slots];
+	let mut replies = vec![0.0; slots];
+	let mut pooled_replies = PRIOR_REPLIES;
+	let mut pooled_intervals = PRIOR_INTERVALS;
+	for (age, wait) in history.iter().rev().enumerate() {
+		let weight = 0.5_f64.powf(age as f64 / WAIT_HALF_LIFE);
+		let last = pings_to_bridge(wait.length, interval) as usize;
+		pooled_intervals += weight * (last + 1) as f64;
+		for slot in reached.iter_mut().take(last + 1) {
+			*slot += weight;
+		}
+		if wait.answered {
+			pooled_replies += weight;
+			if let Some(slot) = replies.get_mut(last) {
+				*slot += weight;
+			}
+		}
+	}
+	let pooled_rate = pooled_replies / pooled_intervals;
+	reached
+		.iter()
+		.zip(&replies)
+		.map(|(reached, replies)| (replies + POOLED_RATE_WEIGHT * pooled_rate) / (reached + POOLED_RATE_WEIGHT))
+		.collect()
 }
 
 async fn run(

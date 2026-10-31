@@ -3617,3 +3617,91 @@ fn tool_image_survives_compression_text_cap_and_live_exchange_selection() {
 		serde_json::to_value(&image_result.images).unwrap()
 	);
 }
+
+// ---------------------------------------------------------------------------
+// replaces_prefix_on_next_request — what the cache keepalive asks before it
+// pays to keep a prefix warm.
+// ---------------------------------------------------------------------------
+
+/// A session with a measured pace and a fire line just above its context, so
+/// one large message crosses it.
+async fn session_below_the_fire_line() -> (crate::session::chat::session::ChatSession, crate::config::Config) {
+	let mut config = fold_config();
+	config.mcp_response_tokens_threshold = 500;
+	let mut session = crate::session::chat::session::ChatSession::for_tests(vec![
+		fold_message("system", "system prompt"),
+		fold_message("user", "task"),
+		fold_message("assistant", "work"),
+		fold_message("user", "next"),
+		fold_message("assistant", "more work"),
+	]);
+	session.model = "notaprovider:no-such-model".to_string();
+	session.session.info.total_api_calls = 100;
+	// Also caches the tool definitions the estimate needs.
+	let baseline = session.get_full_context_tokens(&config).await;
+	config.compression.threshold = baseline + 1000;
+	config.max_session_tokens_threshold = baseline + 100_000;
+	(session, config)
+}
+
+#[tokio::test]
+async fn prefix_is_kept_below_the_fire_line() {
+	let (session, config) = session_below_the_fire_line().await;
+	assert!(!super::replaces_prefix_on_next_request(&session, &config, true));
+	assert!(!super::replaces_prefix_on_next_request(&session, &config, false));
+}
+
+#[tokio::test]
+async fn prefix_is_kept_with_compression_disabled() {
+	let (mut session, mut config) = session_below_the_fire_line().await;
+	session
+		.session
+		.messages
+		.push(fold_message("assistant", &"word ".repeat(4000)));
+	config.compression.threshold = 0;
+	assert!(!super::replaces_prefix_on_next_request(&session, &config, true));
+}
+
+#[tokio::test]
+async fn an_oversized_tool_result_at_the_fire_line_changes_the_prefix_without_being_cut() {
+	let (mut session, config) = session_below_the_fire_line().await;
+	let mut oversized = fold_message("tool", &"payload ".repeat(4000));
+	oversized.name = Some("view".to_string());
+	session.session.messages.push(oversized);
+	let before = serde_json::to_value(&session.session.messages).unwrap();
+
+	// The next check trims it before any fold gate, whatever turn comes next.
+	assert!(super::replaces_prefix_on_next_request(&session, &config, false));
+	assert!(super::replaces_prefix_on_next_request(&session, &config, true));
+	assert_eq!(
+		serde_json::to_value(&session.session.messages).unwrap(),
+		before,
+		"asking must not trim"
+	);
+}
+
+#[tokio::test]
+async fn a_fold_cooldown_holds_the_prefix_on_a_turn_that_keeps_it() {
+	let (mut session, config) = session_below_the_fire_line().await;
+	session
+		.session
+		.messages
+		.push(fold_message("assistant", &"word ".repeat(4000)));
+	session.fold_cooldown_until_call = session.session.info.total_api_calls + 10;
+	assert!(
+		!super::replaces_prefix_on_next_request(&session, &config, false),
+		"a background or tool turn keeps the cooldown, so nothing folds"
+	);
+}
+
+#[tokio::test]
+async fn the_ceiling_margin_changes_the_prefix_past_every_gate() {
+	let mut config = fold_config();
+	config.max_session_tokens_threshold = 8;
+	let mut session = crate::session::chat::session::ChatSession::for_tests(Vec::new());
+	session.model = "notaprovider:no-such-model".to_string();
+	session.add_user_message(&"word ".repeat(200)).expect("user message");
+	session.cached_tools = Some(Vec::new());
+	session.fold_cooldown_until_call = usize::MAX;
+	assert!(super::replaces_prefix_on_next_request(&session, &config, false));
+}

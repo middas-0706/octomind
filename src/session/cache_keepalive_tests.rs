@@ -123,14 +123,29 @@ fn pings_to_bridge_counts_whole_intervals() {
 
 // --- budget ----------------------------------------------------------------
 
+/// Waits oldest first: (minutes, answered).
+fn waits(entries: &[(u64, bool)]) -> VecDeque<Wait> {
+	entries
+		.iter()
+		.map(|&(length, answered)| Wait {
+			length: minutes(length),
+			answered,
+		})
+		.collect()
+}
+
+fn budget(history: &[(u64, bool)]) -> u32 {
+	ping_budget(&waits(history), None, FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY)
+}
+
 #[test]
 fn budget_without_history_is_the_ski_rental_bound() {
-	assert_eq!(ping_budget(&[], None, FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY), 24);
+	assert_eq!(budget(&[]), 24);
 }
 
 #[test]
 fn budget_bridges_an_affordable_known_wake_exactly() {
-	let history = [minutes(200)];
+	let history = waits(&[(200, true)]);
 	assert_eq!(
 		ping_budget(&history, Some(minutes(20)), FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY),
 		4
@@ -140,42 +155,84 @@ fn budget_bridges_an_affordable_known_wake_exactly() {
 #[test]
 fn budget_ignores_a_known_wake_beyond_the_bound() {
 	// 3h needs 40 pings > 24: the wake is not worth bridging, so the budget
-	// falls back to the bound (no history yet).
+	// falls back to the history (none yet: the bound).
 	assert_eq!(
-		ping_budget(&[], Some(minutes(180)), FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY),
+		ping_budget(
+			&VecDeque::new(),
+			Some(minutes(180)),
+			FIVE_MINUTE_INTERVAL,
+			FULL_TAIL_PENALTY
+		),
 		24
 	);
 }
 
 #[test]
-fn budget_covers_waits_the_session_keeps_having() {
-	let history = [minutes(20), minutes(20), minutes(20)];
-	assert_eq!(ping_budget(&history, None, FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY), 4);
-}
-
-#[test]
-fn budget_is_zero_when_waits_always_outlast_the_bound() {
-	let history = [minutes(180), minutes(240)];
+fn budget_is_zero_when_answers_always_outlast_the_bound() {
 	assert_eq!(
-		ping_budget(&history, None, FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY),
+		budget(&[(180, true), (240, true)]),
 		0,
 		"pinging only adds cost when the cache expires anyway"
 	);
 }
 
 #[test]
-fn budget_is_zero_for_waits_shorter_than_one_interval() {
-	let history = [Duration::from_secs(30), Duration::from_secs(90)];
-	assert_eq!(ping_budget(&history, None, FIVE_MINUTE_INTERVAL, FULL_TAIL_PENALTY), 0);
+fn budget_is_zero_after_waits_the_user_walked_away_from() {
+	// Cut-short waits are evidence too: the answer took at least that long.
+	assert_eq!(budget(&[(120, false), (120, false), (120, false)]), 0);
+}
+
+#[test]
+fn budget_covers_the_waits_the_session_keeps_having() {
+	assert!(budget(&[(20, true), (20, true), (20, true)]) >= 4);
+}
+
+#[test]
+fn budget_follows_the_recent_rhythm_over_an_old_one() {
+	let slow = [(180, true); 10];
+	assert_eq!(budget(&slow), 0, "a slow rhythm alone never pays");
+
+	let mut drifted = [(180, true); 10].to_vec();
+	drifted[6..].fill((20, true));
+	assert_eq!(
+		budget(&drifted),
+		4,
+		"recent 20-minute replies outweigh older 3-hour ones"
+	);
+}
+
+#[test]
+fn hazards_without_history_read_as_a_coin_flip() {
+	let hazards = interval_hazards(&VecDeque::new(), FIVE_MINUTE_INTERVAL, 3);
+	assert_eq!(hazards, vec![0.5; 4]);
+}
+
+#[test]
+fn a_cut_short_wait_lowers_the_hazard_of_the_intervals_it_reached() {
+	let hazards = interval_hazards(&waits(&[(60, false)]), FIVE_MINUTE_INTERVAL, 3);
+	assert!(hazards.iter().all(|h| *h < 0.5), "got {:?}", hazards);
 }
 
 #[test]
 fn wait_history_keeps_kinds_apart() {
 	let mut history = WaitHistory::default();
-	history.record(WaitKind::Reply, minutes(10));
-	history.record(WaitKind::Tools, minutes(3));
-	assert_eq!(history.samples(WaitKind::Reply), &[minutes(10)]);
-	assert_eq!(history.samples(WaitKind::Tools), &[minutes(3)]);
+	history.record(WaitKind::Reply, minutes(10), true);
+	history.record(WaitKind::Background, minutes(1), true);
+	history.record(WaitKind::Tools, minutes(3), false);
+	assert_eq!(history.samples(WaitKind::Reply), &waits(&[(10, true)]));
+	assert_eq!(history.samples(WaitKind::Background), &waits(&[(1, true)]));
+	assert_eq!(history.samples(WaitKind::Tools), &waits(&[(3, false)]));
+}
+
+#[test]
+fn wait_history_keeps_only_the_recent_waits() {
+	let mut history = WaitHistory::default();
+	for n in 0..(MAX_WAITS as u64 + 8) {
+		history.record(WaitKind::Reply, minutes(n), true);
+	}
+	let kept = history.samples(WaitKind::Reply);
+	assert_eq!(kept.len(), MAX_WAITS);
+	assert_eq!(kept.front().map(|w| w.length), Some(minutes(8)), "the oldest go first");
 }
 
 // --- spawn -----------------------------------------------------------------
@@ -217,21 +274,26 @@ async fn spawn_returns_none_for_provider_without_keepalive_policy() {
 }
 
 #[tokio::test]
-async fn finish_records_a_completed_wait_and_skips_an_abandoned_one() {
+async fn finish_records_how_the_wait_ended() {
 	let config = keepalive_config();
 	let mut chat = session("anthropic:claude-sonnet-5-5", vec![user_message(true)]);
 
 	let handle = KeepaliveHandle::spawn(&chat, &config, WaitKind::Tools).expect("cached Anthropic session spawns");
 	// The first ping is one interval away, so finishing now sends nothing.
 	assert_eq!(handle.finish(&mut chat, true).await, 0);
-	assert_eq!(chat.wait_history.samples(WaitKind::Tools).len(), 1);
-
 	let handle = KeepaliveHandle::spawn(&chat, &config, WaitKind::Tools).expect("spawns again");
 	handle.finish(&mut chat, false).await;
+
+	let recorded: Vec<bool> = chat
+		.wait_history
+		.samples(WaitKind::Tools)
+		.iter()
+		.map(|w| w.answered)
+		.collect();
 	assert_eq!(
-		chat.wait_history.samples(WaitKind::Tools).len(),
-		1,
-		"an abandoned wait must not feed the budget"
+		recorded,
+		vec![true, false],
+		"answered and cut-short waits both feed the budget"
 	);
 }
 

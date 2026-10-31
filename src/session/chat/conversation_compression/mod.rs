@@ -66,6 +66,70 @@ use crate::session::chat::session::ChatSession;
 use crate::{log_debug, log_info};
 use anyhow::Result;
 
+/// True when the next request will not reuse the cached prefix, so a cache
+/// keepalive would pay to keep warm an entry nothing reads again. The
+/// provider's cache is keyed by the exact prefix: anything the next
+/// compression check rewrites — a fold applied, old tool results trimmed —
+/// orphans the whole entry, never just its tail.
+///
+/// Mirrors that check side-effect free, in its order: a background fold in
+/// flight lands first; the ceiling margin forces a fold past every gate;
+/// below the fire line nothing changes; at it, oversized tool results are
+/// trimmed before any gate; then a fold cooldown or a standing deferral holds
+/// the fold, and the amortization decides. `next_is_user_turn`: the next
+/// request opens a genuine user turn, which resets the runway, the cooldown
+/// and any deferral and makes the fold free (`add_user_message`).
+pub fn replaces_prefix_on_next_request(session: &ChatSession, config: &Config, next_is_user_turn: bool) -> bool {
+	if session.fold_job.is_some() {
+		return true;
+	}
+	if config.compression.threshold == 0 {
+		return false;
+	}
+	let Some(raw) = session.raw_context_estimate() else {
+		return false;
+	};
+	let current_tokens = session.calibrated(raw);
+	let mut info = session.session.info.clone();
+	if next_is_user_turn {
+		info.consecutive_compressions = 0;
+		info.note_turn_start();
+	}
+	let ceiling = context_ceiling(session, config);
+	if ceiling_reached(&info, current_tokens, ceiling) {
+		return true;
+	}
+	let growth = measured_growth_rate(&info, current_tokens);
+	let runway = autonomous_runway(info.consecutive_compressions);
+	let fire_line = adaptive_fire_line(
+		config.compression.threshold,
+		ceiling,
+		info.context_tokens_after_last_compression,
+		growth,
+		info.consecutive_compressions,
+	);
+	if current_tokens < fire_line {
+		return false;
+	}
+	if has_oversized_tool_results(session, config.mcp_response_tokens_threshold) {
+		return true;
+	}
+	if !next_is_user_turn {
+		if info.total_api_calls < session.fold_cooldown_until_call {
+			return false;
+		}
+		let current_step = crate::mcp::core::plan::active_step_index();
+		let agent_blocked = session.last_self_report == Some(crate::supervisor::detect::SelfReport::Blocked);
+		if session
+			.fold_deferral
+			.is_some_and(|deferral| deferral.stands_against(current_step, agent_blocked))
+		{
+			return false;
+		}
+	}
+	fold_ratio(session, &info, config, current_tokens, fire_line, growth, runway).is_some()
+}
+
 /// Check if we should ask AI about compression
 /// Returns (should_compress, target_ratio) tuple
 ///
@@ -157,6 +221,34 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 		runway
 	);
 
+	match fold_ratio(
+		session,
+		&session.session.info,
+		config,
+		current_tokens,
+		fire_line,
+		growth,
+		runway,
+	) {
+		Some(ratio) => (true, ratio),
+		None => (false, MIN_COMPRESSION_RATIO),
+	}
+}
+
+/// The fold behind the fire line as pure math over the drain range: the
+/// adaptive depth from measured dynamics, then the amortization gate, which is
+/// free at a genuine turn boundary. `Some(ratio)` when the fold goes ahead.
+/// `info` is the state the decision is taken under — the live one, or the
+/// predicted next turn's (see [`replaces_prefix_on_next_request`]).
+fn fold_ratio(
+	session: &ChatSession,
+	info: &crate::session::SessionInfo,
+	config: &Config,
+	current_tokens: usize,
+	fire_line: usize,
+	growth: f64,
+	runway: f64,
+) -> Option<f64> {
 	// ADAPTIVE DEPTH: pick the post-compression target from measured dynamics.
 	// Pure math over the drain range — no API cost, so it runs before the cost
 	// gate and its derived ratio feeds the pricing analysis.
@@ -164,7 +256,7 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 		Ok(range) => range,
 		Err(e) => {
 			log_debug!("Failed to find compression range: {}", e);
-			return (false, MIN_COMPRESSION_RATIO);
+			return None;
 		}
 	};
 
@@ -174,7 +266,7 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 			start_idx,
 			end_idx
 		);
-		return (false, MIN_COMPRESSION_RATIO);
+		return None;
 	}
 
 	// Count only start_idx+1..=end_idx — the anchor at start_idx is kept
@@ -182,7 +274,7 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 		Ok(tokens) => tokens,
 		Err(e) => {
 			log_debug!("Failed to calculate range tokens: {}", e);
-			return (false, MIN_COMPRESSION_RATIO);
+			return None;
 		}
 	};
 
@@ -195,7 +287,7 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 			compressible_tokens,
 			fire_line
 		);
-		return (false, MIN_COMPRESSION_RATIO);
+		return None;
 	};
 
 	// The fold behind the fire line: free at a genuine turn boundary, otherwise
@@ -214,7 +306,7 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 	};
 	let econ = FoldEconomics::resolve(session, config);
 	let fold = fold_decision(
-		&session.session.info,
+		info,
 		current_tokens as f64,
 		target_after,
 		compressible,
@@ -225,19 +317,15 @@ pub async fn should_check_compression(session: &mut ChatSession, config: &Config
 	log_debug!(
 		"Fold decision: {} (boundary={}, expected_calls={:.0}, runway={:.0}, current={}, target_after={:.0}, ratio={:.1}x, econ={:?})",
 		if fold { "COMPRESS" } else { "WAIT" },
-		at_turn_boundary(&session.session.info),
-		expected_remaining_calls(&session.session.info),
+		at_turn_boundary(info),
+		expected_remaining_calls(info),
 		runway,
 		current_tokens,
 		target_after,
 		adjusted_ratio,
 		econ
 	);
-	if fold {
-		(true, adjusted_ratio)
-	} else {
-		(false, MIN_COMPRESSION_RATIO)
-	}
+	fold.then_some(adjusted_ratio)
 }
 
 /// Cut every stored tool result back to the configured response cap; returns
@@ -271,6 +359,20 @@ fn trim_oversized_tool_results(session: &mut ChatSession, cap: usize) -> usize {
 		crate::session::context::bump_context_epoch();
 	}
 	trimmed
+}
+
+/// Whether [`trim_oversized_tool_results`] would cut anything, without cutting.
+fn has_oversized_tool_results(session: &ChatSession, cap: usize) -> bool {
+	cap > 0
+		&& session.session.messages.iter().any(|message| {
+			message.role == "tool"
+				&& crate::utils::truncation::truncate_mcp_response_global(
+					&message.content,
+					cap,
+					message.name.as_deref().unwrap_or_default(),
+				)
+				.1
+		})
 }
 
 /// Refuse an API call only when the fully materialized context remains above

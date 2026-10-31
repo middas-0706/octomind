@@ -254,15 +254,15 @@ impl ServerState {
 		}
 	}
 
-	/// Ends the session's keepalive, if it has one, and bills its pings to the
-	/// session. `waited`: the wait ended with the turn it preceded, not with a
+	/// Ends the session's keepalive, if it has one, bills its pings and records
+	/// the wait. `answered`: the client acted (a turn or a command), not a
 	/// disconnect or an unload. Returns the ping count.
-	async fn finish_keepalive(&self, chat_session: &mut ChatSession, waited: bool) -> usize {
+	async fn finish_keepalive(&self, chat_session: &mut ChatSession, answered: bool) -> usize {
 		let handle = self.keepalives.lock().unwrap().remove(&chat_session.session.info.name);
 		let Some(handle) = handle else {
 			return 0;
 		};
-		handle.finish(chat_session, waited).await
+		handle.finish(chat_session, answered).await
 	}
 }
 
@@ -1906,7 +1906,8 @@ async fn handle_command_message(msg: CommandMessage, ws_sender: &WsSender, serve
 	let session_id = session_id.to_string();
 	let stream = turn_stream(server, &session_id, ws_sender);
 	let config_for_role = session_config(&server.config, &server.role_configs, &chat_session).await;
-	server.finish_keepalive(&mut chat_session, false).await;
+	// A command is the client acting: the wait got its answer.
+	server.finish_keepalive(&mut chat_session, true).await;
 	let mut cancellation = SessionCancellation::new();
 	let operation_rx = cancellation.new_operation();
 	let _turn = TurnGuard::register(server, &session_id, &cancellation);

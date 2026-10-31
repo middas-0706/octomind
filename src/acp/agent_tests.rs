@@ -2149,10 +2149,9 @@ async fn finish_keepalives_drains_handles_keeps_sessions_and_records_no_wait() {
 	for session_id in ["ka-one", "ka-two"] {
 		let (session, kept_cwd) = sessions.get(session_id).expect("session stays in the map");
 		assert_eq!(kept_cwd, &cwd);
-		assert!(
-			session.wait_history.samples(WaitKind::Reply).is_empty(),
-			"connection end is not an answered wait"
-		);
+		let waits = session.wait_history.samples(WaitKind::Reply);
+		assert_eq!(waits.len(), 1, "the wait is recorded");
+		assert!(!waits[0].answered, "connection end cuts the wait short");
 	}
 }
 

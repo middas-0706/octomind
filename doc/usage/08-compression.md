@@ -107,14 +107,23 @@ cache_keepalive_enabled = true  # opt in; shipped default is false
 ```
 
 - Only models whose provider returns a keepalive policy are pinged; the runtime skips other models.
+- Through `octohub:` the hub decides per lane: a ping goes only to the provider that served the conversation, and a
+  lane whose provider cannot be pre-warmed answers with a zero-read, zero-cost reply, which ends the keepalive. Needs
+  octohub >= 0.16.3.
 - The ping **interval is 0.9 × the TTL of the newest cache marker** (270s for the 5m conversation cache), not a config
   value.
-- The stop rule is derived from model pricing and the session's observed waits (ski-rental), bounded by
-  `(cache_write − cache_read) / cache_read` pings: about 24 pings, roughly 108 min, on Opus/Sonnet 5.5. A known
-  scheduled wake is bridged exactly when affordable.
+- How many pings a wait gets is priced, never capped by time. A ping costs one cache read of the prompt; letting the
+  cache expire costs a rewrite of the conversation tail (tools and the system prompt stay warm on their 1h cache).
+  The n-th ping is sent only while the chance that the wait ends in the next interval beats ping cost / rewrite
+  saved. That chance is learned per session from its own waits — replies, background work (tap runs, shell or agent
+  jobs) and tool runs each separately, recent waits weighted most, waits cut short (exit, disconnect) included.
+  With no history the budget is the ski-rental bound `(cache_write − cache_read) / cache_read × tail share`.
+- A known scheduled wake is bridged exactly when affordable.
+- No ping is sent when the next request will compress or trim the conversation anyway: the cached prompt would not
+  be read again.
 - A ping that misses the cache stops the keepalive.
 - Pings only fire when the snapshot actually has a cached message (otherwise there is nothing to keep warm).
-- Each ping costs cache-read tokens; those costs are folded back into the session cost.
+- Each ping is billed to the session cost only; it does not count as an API call or as prompt tokens.
 
 ## Monitoring
 

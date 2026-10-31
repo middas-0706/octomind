@@ -88,20 +88,20 @@ async fn init_session_runtime(
 	})
 }
 
-/// Stop any in-flight cache-keepalive task and bill its pings to the session.
-/// `waited` is true when the wait ended with its answer (new input arrived) so
-/// it feeds future ping budgets; false on session exit. Returns `true` when at
-/// least one ping was billed — callers that persist post-fold (session save)
-/// check this to skip a no-op write.
+/// Stop any in-flight cache-keepalive task, bill its pings and record the
+/// wait. `answered` is true when the wait ended with new input; false when the
+/// session exits first, a cut-short wait that still feeds future budgets.
+/// Returns `true` when at least one ping was billed — callers that persist
+/// post-fold (session save) check this to skip a no-op write.
 async fn drain_keepalive_into_session(
 	keepalive: &mut Option<KeepaliveHandle>,
 	chat_session: &mut ChatSession,
-	waited: bool,
+	answered: bool,
 ) -> bool {
 	let Some(handle) = keepalive.take() else {
 		return false;
 	};
-	handle.finish(chat_session, waited).await > 0
+	handle.finish(chat_session, answered).await > 0
 }
 
 /// Apply clipboard blobs auto-attached via Ctrl+V to the active session.

@@ -5776,7 +5776,7 @@ async fn start_keepalive_registers_a_handle_only_with_a_live_owner() {
 }
 
 #[tokio::test]
-async fn finish_keepalive_removes_the_handle_and_records_the_wait_only_when_waited() {
+async fn finish_keepalive_removes_the_handle_and_records_how_the_wait_ended() {
 	let config = keepalive_config();
 	let server = ServerState::new(Arc::new(config.clone()), "assistant".into(), Vec::new());
 	let mut session = keepalive_session("ka-finish");
@@ -5787,10 +5787,9 @@ async fn finish_keepalive_removes_the_handle_and_records_the_wait_only_when_wait
 	server.start_keepalive(&session, &config, &stream);
 	assert_eq!(server.finish_keepalive(&mut session, false).await, 0);
 	assert!(server.keepalives.lock().unwrap().is_empty());
-	assert!(
-		session.wait_history.samples(WaitKind::Reply).is_empty(),
-		"an abandoned wait is not recorded"
-	);
+	let waits = session.wait_history.samples(WaitKind::Reply);
+	assert_eq!(waits.len(), 1);
+	assert!(!waits[0].answered, "a disconnect or unload cuts the wait short");
 
 	server.start_keepalive(&session, &config, &stream);
 	assert_eq!(
@@ -5799,14 +5798,16 @@ async fn finish_keepalive_removes_the_handle_and_records_the_wait_only_when_wait
 		"the first ping is minutes away"
 	);
 	assert!(server.keepalives.lock().unwrap().is_empty());
-	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+	let waits = session.wait_history.samples(WaitKind::Reply);
+	assert_eq!(waits.len(), 2);
+	assert!(waits[1].answered, "a turn answers the wait");
 
 	assert_eq!(
 		server.finish_keepalive(&mut session, true).await,
 		0,
 		"no handle: nothing to finish"
 	);
-	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 2);
 	crate::session::context::cleanup_session(&"ka-finish".to_string());
 }
 
@@ -5829,10 +5830,9 @@ async fn release_ownerless_keepalive_stops_the_handle_and_returns_the_session() 
 	assert!(server.keepalives.lock().unwrap().is_empty());
 	let sessions = server.sessions.lock().await;
 	let session = sessions.get("ka-release").expect("the session is put back");
-	assert!(
-		session.wait_history.samples(WaitKind::Reply).is_empty(),
-		"a disconnect is not a completed wait"
-	);
+	let waits = session.wait_history.samples(WaitKind::Reply);
+	assert_eq!(waits.len(), 1);
+	assert!(!waits[0].answered, "a disconnect cuts the wait short");
 	drop(sessions);
 	crate::session::context::cleanup_session(&"ka-release".to_string());
 }

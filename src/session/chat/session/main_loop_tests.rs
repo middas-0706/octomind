@@ -1161,17 +1161,21 @@ async fn drain_keepalive_with_waited_handle_records_a_reply_wait_and_empties_the
 	// Zero pings billed: the first ping is a full interval away.
 	assert!(!drain_keepalive_into_session(&mut keepalive, &mut session, true).await);
 	assert!(keepalive.is_none(), "drain must take the handle");
-	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+	let waits = session.wait_history.samples(WaitKind::Reply);
+	assert_eq!(waits.len(), 1);
+	assert!(waits[0].answered, "new input answers the wait");
 	assert!(session.wait_history.samples(WaitKind::Tools).is_empty());
 }
 
 #[tokio::test]
-async fn drain_keepalive_with_abandoned_wait_records_no_sample() {
+async fn drain_keepalive_on_exit_records_a_cut_short_wait() {
 	let mut session = ChatSession::for_tests(Vec::new());
 	let mut keepalive = spawn_reply_keepalive(&mut session);
 	assert!(keepalive.is_some(), "cached Anthropic session must spawn a keepalive");
 
 	assert!(!drain_keepalive_into_session(&mut keepalive, &mut session, false).await);
 	assert!(keepalive.is_none(), "drain must take the handle");
-	assert!(session.wait_history.samples(WaitKind::Reply).is_empty());
+	let waits = session.wait_history.samples(WaitKind::Reply);
+	assert_eq!(waits.len(), 1, "a cut-short wait still feeds the budget");
+	assert!(!waits[0].answered);
 }

@@ -562,8 +562,9 @@ pub async fn process_response<S: OutputSink>(params: ResponseProcessingParams<'_
 				)
 				.await;
 				if let Some(handle) = keepalive {
-					let waited = tool_run.is_ok() && !*operation_cancelled_clone.borrow();
-					handle.finish(params.chat_session, waited).await;
+					// A failed tool still ran to its end; only a cancel cuts the wait short.
+					let answered = !*operation_cancelled_clone.borrow();
+					handle.finish(params.chat_session, answered).await;
 				}
 				let (tool_results, total_tool_time_ms) = match tool_run {
 					Ok(results) => results,
