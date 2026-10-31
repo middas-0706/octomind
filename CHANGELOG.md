@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.67.3] - 2026-10-31
+
+### 📋 Release Summary
+
+Keepalive budgets now adapt, and keepalive lifecycle management has been reworked. Keepalive pings are now included in session cost accounting.
+
+### 🚨 Breaking Changes
+
+- rework cache keepalive budgeting and lifecycle `27fa3e47`
+
+### ✨ New Features & Enhancements
+
+- **keepalive**: adapt cache keepalive budgets `23417345`
+
+### 🔧 Improvements & Optimizations
+
+- **dependencies**: update octolib to 0.48.5 `b7cfbbdf`
+- **keepalive**: cover keepalive lifecycle edge cases `47b0f9dd`
+- **dependencies**: update octolib to 0.48.4 `69686d48`
+
+### 🐛 Bug Fixes & Stability
+
+- **session**: bill keepalive pings to session cost `09d541a4`
+
 ## [0.67.2] - 2026-10-31
 
 ### 📋 Release Summary
