@@ -667,6 +667,53 @@ async fn test_process_response_tool_round_emits_tooluse_result_and_final_answer(
 }
 
 #[tokio::test]
+async fn test_process_response_tool_round_without_keepalive_policy_records_no_tool_wait() {
+	let _guard = ENV_LOCK.lock().await;
+	let url = spawn_stub(vec![final_response("All done")]).await;
+	std::env::set_var("OLLAMA_API_URL", &url);
+
+	// Ollama has no keepalive policy: the gate must yield no handle even
+	// though keepalive is enabled and the tool round runs.
+	let mut config = config_with_core_server(fake_provider_config());
+	config.cache_keepalive_enabled = true;
+	let mut session = fake_session("run the thing");
+	session.session.messages[0].cached = true;
+	let (_tx, rx) = tokio::sync::watch::channel(false);
+
+	let exchange = ProviderExchange::new(
+		json!({}),
+		json!({"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "zzz_missing_tool", "arguments": "{}"}}]}),
+		None,
+		"test",
+	);
+	let params = ResponseProcessingParams {
+		content: "Working".to_string(),
+		exchange,
+		tool_calls: Some(vec![crate::mcp::McpToolCall {
+			tool_name: "zzz_missing_tool".to_string(),
+			parameters: json!({}),
+			tool_id: "call_1".to_string(),
+		}]),
+		thinking: None,
+		finish_reason: Some("tool_calls".to_string()),
+		response_id: Some("resp_1".to_string()),
+		chat_session: &mut session,
+		config: &config,
+		role: "assistant",
+		operation_cancelled: rx,
+		sink: recording_sink(),
+		mode: OutputMode::Jsonl,
+	};
+
+	process_response(params).await.expect("tool round processing");
+
+	let roles: Vec<&str> = session.session.messages.iter().map(|m| m.role.as_str()).collect();
+	assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+	assert_eq!(session.last_response, "All done");
+	assert!(session.wait_history.samples(WaitKind::Tools).is_empty());
+}
+
+#[tokio::test]
 #[cfg(unix)]
 async fn test_process_response_supervisor_loop_fires_steer_mid_turn() {
 	let _guard = ENV_LOCK.lock().await;

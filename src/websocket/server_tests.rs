@@ -5728,3 +5728,138 @@ async fn observe_after_a_bind_is_refused_and_the_connection_keeps_its_session() 
 
 	crate::session::context::cleanup_session(&"obs-after-bind".to_string());
 }
+
+// ---- idle prompt-cache keepalive ----
+
+fn keepalive_config() -> Config {
+	let mut config = template_config();
+	config.cache_keepalive_enabled = true;
+	config
+}
+
+/// A session `KeepaliveHandle::spawn` accepts: a keepalive-capable model and a
+/// cached message to replay.
+fn keepalive_session(session_id: &str) -> ChatSession {
+	let cached = crate::session::Message {
+		role: "user".into(),
+		content: "hi".into(),
+		cached: true,
+		..crate::session::Message::default()
+	};
+	let mut session = ChatSession::for_tests(vec![cached]);
+	session.model = "anthropic:claude-sonnet-5-5".to_string();
+	session.session.info.name = session_id.to_string();
+	session
+}
+
+#[tokio::test]
+async fn start_keepalive_registers_a_handle_only_with_a_live_owner() {
+	let config = keepalive_config();
+	let server = ServerState::new(Arc::new(config.clone()), "assistant".into(), Vec::new());
+	let session = keepalive_session("ka-owner");
+	let stream = server.streams.open("ka-owner");
+
+	server.start_keepalive(&session, &config, &stream);
+	assert!(
+		server.keepalives.lock().unwrap().is_empty(),
+		"nobody could reply, so no keepalive starts"
+	);
+
+	let (sender, _receiver) = WsSender::channel();
+	stream.own(&sender);
+	server.start_keepalive(&session, &config, &stream);
+	assert!(server.keepalives.lock().unwrap().contains_key("ka-owner"));
+
+	let mut session = session;
+	server.finish_keepalive(&mut session, false).await;
+	crate::session::context::cleanup_session(&"ka-owner".to_string());
+}
+
+#[tokio::test]
+async fn finish_keepalive_removes_the_handle_and_records_the_wait_only_when_waited() {
+	let config = keepalive_config();
+	let server = ServerState::new(Arc::new(config.clone()), "assistant".into(), Vec::new());
+	let mut session = keepalive_session("ka-finish");
+	let stream = server.streams.open("ka-finish");
+	let (sender, _receiver) = WsSender::channel();
+	stream.own(&sender);
+
+	server.start_keepalive(&session, &config, &stream);
+	assert_eq!(server.finish_keepalive(&mut session, false).await, 0);
+	assert!(server.keepalives.lock().unwrap().is_empty());
+	assert!(
+		session.wait_history.samples(WaitKind::Reply).is_empty(),
+		"an abandoned wait is not recorded"
+	);
+
+	server.start_keepalive(&session, &config, &stream);
+	assert_eq!(
+		server.finish_keepalive(&mut session, true).await,
+		0,
+		"the first ping is minutes away"
+	);
+	assert!(server.keepalives.lock().unwrap().is_empty());
+	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+
+	assert_eq!(
+		server.finish_keepalive(&mut session, true).await,
+		0,
+		"no handle: nothing to finish"
+	);
+	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+	crate::session::context::cleanup_session(&"ka-finish".to_string());
+}
+
+#[tokio::test]
+async fn release_ownerless_keepalive_stops_the_handle_and_returns_the_session() {
+	let config = keepalive_config();
+	let server = ServerState::new(Arc::new(config.clone()), "assistant".into(), Vec::new());
+	let session = keepalive_session("ka-release");
+	let stream = server.streams.open("ka-release");
+	let (sender, _receiver) = WsSender::channel();
+	stream.own(&sender);
+	server.start_keepalive(&session, &config, &stream);
+	assert!(server.keepalives.lock().unwrap().contains_key("ka-release"));
+	server.sessions.lock().await.insert("ka-release".to_string(), session);
+
+	server.streams.detach(&sender);
+	assert!(!stream.has_live_owner());
+	release_ownerless_keepalive(server.clone(), "ka-release".to_string()).await;
+
+	assert!(server.keepalives.lock().unwrap().is_empty());
+	let sessions = server.sessions.lock().await;
+	let session = sessions.get("ka-release").expect("the session is put back");
+	assert!(
+		session.wait_history.samples(WaitKind::Reply).is_empty(),
+		"a disconnect is not a completed wait"
+	);
+	drop(sessions);
+	crate::session::context::cleanup_session(&"ka-release".to_string());
+}
+
+#[tokio::test]
+async fn release_ownerless_keepalive_leaves_the_handle_when_the_owner_is_live_again() {
+	let config = keepalive_config();
+	let server = ServerState::new(Arc::new(config.clone()), "assistant".into(), Vec::new());
+	let session = keepalive_session("ka-rebound");
+	let stream = server.streams.open("ka-rebound");
+	let (sender, _receiver) = WsSender::channel();
+	stream.own(&sender);
+	server.start_keepalive(&session, &config, &stream);
+	server.sessions.lock().await.insert("ka-rebound".to_string(), session);
+
+	server.streams.detach(&sender);
+	let (rebound, _rebound_receiver) = WsSender::channel();
+	stream.own(&rebound);
+	release_ownerless_keepalive(server.clone(), "ka-rebound".to_string()).await;
+
+	assert!(server.keepalives.lock().unwrap().contains_key("ka-rebound"));
+	let mut session = server
+		.sessions
+		.lock()
+		.await
+		.remove("ka-rebound")
+		.expect("the session stays where it was");
+	server.finish_keepalive(&mut session, false).await;
+	crate::session::context::cleanup_session(&"ka-rebound".to_string());
+}

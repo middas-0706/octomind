@@ -2094,3 +2094,127 @@ async fn initialize_keeps_the_client_elicitation_capability() {
 		.expect("initialize succeeds");
 	assert_eq!(agent.elicitation_support.get(), full_support());
 }
+
+// ---- idle prompt-cache keepalive ----
+
+/// A cached Anthropic session: the only shape that offline `spawn` accepts.
+fn cached_anthropic_session(name: &str) -> ChatSession {
+	let mut message = msg("user", "hello");
+	message.cached = true;
+	let mut session = ChatSession::for_tests(vec![message]);
+	session.model = "anthropic:claude-sonnet-5-5".to_string();
+	session.session.info.name = name.to_owned();
+	session
+}
+
+fn keepalive_config() -> Config {
+	let mut config = template_config();
+	config.cache_keepalive_enabled = true;
+	config
+}
+
+/// Registers a live keepalive for `session` (first ping is 270s away, so
+/// finishing early sends nothing).
+fn register_keepalive(agent: &OctomindAgent, session_id: &str, session: &ChatSession) {
+	let handle = KeepaliveHandle::spawn(session, &keepalive_config(), WaitKind::Reply)
+		.expect("cached Anthropic session spawns a keepalive");
+	agent.keepalives.borrow_mut().insert(session_id.to_string(), handle);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn finish_keepalives_drains_handles_keeps_sessions_and_records_no_wait() {
+	let _data = TestDataDirGuard::new();
+	let agent = Rc::new(OctomindAgent::new(
+		keepalive_config(),
+		"assistant".to_string(),
+		Default::default(),
+	));
+	let cwd = std::env::current_dir().expect("cwd");
+
+	for session_id in ["ka-one", "ka-two"] {
+		let session = cached_anthropic_session(session_id);
+		register_keepalive(&agent, session_id, &session);
+		agent
+			.sessions
+			.borrow_mut()
+			.insert(session_id.to_string(), (session, cwd.clone()));
+	}
+	assert_eq!(agent.keepalives.borrow().len(), 2);
+
+	agent.finish_keepalives().await;
+
+	assert!(agent.keepalives.borrow().is_empty(), "every handle is drained");
+	let sessions = agent.sessions.borrow();
+	for session_id in ["ka-one", "ka-two"] {
+		let (session, kept_cwd) = sessions.get(session_id).expect("session stays in the map");
+		assert_eq!(kept_cwd, &cwd);
+		assert!(
+			session.wait_history.samples(WaitKind::Reply).is_empty(),
+			"connection end is not an answered wait"
+		);
+	}
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn finish_keepalives_drops_a_handle_whose_session_is_gone() {
+	let _data = TestDataDirGuard::new();
+	let agent = Rc::new(OctomindAgent::new(
+		keepalive_config(),
+		"assistant".to_string(),
+		Default::default(),
+	));
+
+	// The handle outlived its session: the session is not in the map.
+	register_keepalive(&agent, "ka-ghost", &cached_anthropic_session("ka-ghost"));
+	// A sibling with a session must still be finished and kept.
+	let live = cached_anthropic_session("ka-live");
+	register_keepalive(&agent, "ka-live", &live);
+	agent
+		.sessions
+		.borrow_mut()
+		.insert("ka-live".to_string(), (live, std::env::current_dir().expect("cwd")));
+
+	agent.finish_keepalives().await;
+
+	assert!(agent.keepalives.borrow().is_empty());
+	let sessions = agent.sessions.borrow();
+	assert!(
+		!sessions.contains_key("ka-ghost"),
+		"no session is invented for the orphan"
+	);
+	assert!(sessions.contains_key("ka-live"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
+async fn prompt_registers_no_keepalive_without_a_provider_policy() {
+	let _data = TestDataDirGuard::new();
+	let _env = StubEnv::new(vec![final_response("NO-KEEPALIVE")]).await;
+	let agent = acp_agent();
+	// Keepalive is on, so only the provider gate (ollama has no policy) can refuse.
+	agent.config.borrow_mut().cache_keepalive_enabled = true;
+	let cwd = std::env::current_dir().expect("cwd");
+
+	let local = tokio::task::LocalSet::new();
+	local
+		.run_until(async {
+			let new = agent
+				.new_session(NewSessionRequest::new(cwd))
+				.await
+				.expect("new session");
+			let session_id = new.session_id.to_string();
+
+			let response = agent
+				.prompt(PromptRequest::new(session_id.clone(), vec!["hello".into()]))
+				.await
+				.expect("prompt completes");
+			assert!(matches!(response.stop_reason, StopReason::EndTurn));
+
+			assert!(agent.keepalives.borrow().is_empty(), "ollama has no keepalive policy");
+			assert!(agent.sessions.borrow().contains_key(&session_id));
+			context::cleanup_session(&session_id);
+		})
+		.await;
+}

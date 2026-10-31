@@ -306,6 +306,32 @@ async fn test_next_schedule_sleep_timer_and_notify_arms_in_session() {
 	.await;
 }
 
+#[tokio::test]
+async fn test_next_due_in_reads_the_session_store() {
+	crate::session::context::with_session_id("sched-next-due".to_string(), async {
+		assert_eq!(next_due_in(), None, "an empty store has no known wake");
+
+		let store = crate::session::context::get_schedule_storage(&"sched-next-due".to_string());
+		store.lock().unwrap().add(ScheduleEntry::new(
+			String::new(),
+			ScheduleAction::Message {
+				message: "later".to_string(),
+			},
+			chrono::Local::now() + chrono::Duration::seconds(1_200),
+			None,
+		));
+		let wake = next_due_in().expect("the entry is a known wake");
+		assert!(
+			wake > std::time::Duration::from_secs(1_100) && wake <= std::time::Duration::from_secs(1_200),
+			"got {:?}",
+			wake
+		);
+
+		crate::session::context::clear_schedule_storage(&"sched-next-due".to_string());
+	})
+	.await;
+}
+
 /// The two no-session arms share the process-global store, so they are serial
 /// and drain it before and after.
 #[serial]

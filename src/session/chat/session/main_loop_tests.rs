@@ -1127,3 +1127,51 @@ async fn new_session_releases_active_fixed_port_hook_before_runtime_init() {
 	crate::session::context::cleanup_session(&old_id);
 	crate::session::context::cleanup_session(&new_id);
 }
+
+/// Offline keepalive handle: a cached Anthropic prefix spawns a handle whose
+/// first ping is one interval away, so finishing it right away bills nothing.
+fn spawn_reply_keepalive(chat_session: &mut ChatSession) -> Option<KeepaliveHandle> {
+	chat_session.model = "anthropic:claude-sonnet-5-5".to_string();
+	chat_session.session.messages = vec![Message {
+		role: "user".to_string(),
+		content: "hello".to_string(),
+		cached: true,
+		..Default::default()
+	}];
+	let mut config = fake_provider_config();
+	config.cache_keepalive_enabled = true;
+	KeepaliveHandle::spawn(chat_session, &config, WaitKind::Reply)
+}
+
+#[tokio::test]
+async fn drain_keepalive_without_handle_returns_false_and_records_nothing() {
+	let mut session = ChatSession::for_tests(Vec::new());
+	let mut keepalive = None;
+	assert!(!drain_keepalive_into_session(&mut keepalive, &mut session, true).await);
+	assert!(session.wait_history.samples(WaitKind::Reply).is_empty());
+	assert!(session.wait_history.samples(WaitKind::Tools).is_empty());
+}
+
+#[tokio::test]
+async fn drain_keepalive_with_waited_handle_records_a_reply_wait_and_empties_the_option() {
+	let mut session = ChatSession::for_tests(Vec::new());
+	let mut keepalive = spawn_reply_keepalive(&mut session);
+	assert!(keepalive.is_some(), "cached Anthropic session must spawn a keepalive");
+
+	// Zero pings billed: the first ping is a full interval away.
+	assert!(!drain_keepalive_into_session(&mut keepalive, &mut session, true).await);
+	assert!(keepalive.is_none(), "drain must take the handle");
+	assert_eq!(session.wait_history.samples(WaitKind::Reply).len(), 1);
+	assert!(session.wait_history.samples(WaitKind::Tools).is_empty());
+}
+
+#[tokio::test]
+async fn drain_keepalive_with_abandoned_wait_records_no_sample() {
+	let mut session = ChatSession::for_tests(Vec::new());
+	let mut keepalive = spawn_reply_keepalive(&mut session);
+	assert!(keepalive.is_some(), "cached Anthropic session must spawn a keepalive");
+
+	assert!(!drain_keepalive_into_session(&mut keepalive, &mut session, false).await);
+	assert!(keepalive.is_none(), "drain must take the handle");
+	assert!(session.wait_history.samples(WaitKind::Reply).is_empty());
+}
